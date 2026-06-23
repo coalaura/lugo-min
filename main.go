@@ -14,13 +14,19 @@ import (
 )
 
 var (
-	flagWrite           bool
-	flagOutput          string
-	flagNoRename        bool
-	flagCacheGlobals    bool
-	flagOptimizeLoops   bool
-	flagConstFold       bool
-	flagGlobalThreshold int
+	flagWrite               bool
+	flagOutput              string
+	flagNoRename            bool
+	flagCacheGlobals        bool
+	flagOptimizeLoops       bool
+	flagConstFold           bool
+	flagCombineLocals       bool
+	flagOptimizeTableInsert bool
+	flagGlobalThreshold     int
+	flagMaxLocals           int
+	flagReservedNames       []string
+	flagNoShadowAllGlobals  bool
+	flagNoShadowRefGlobals  bool
 )
 
 var command = &cobra.Command{
@@ -39,7 +45,13 @@ func init() {
 	flags.BoolVar(&flagCacheGlobals, "cache-globals", true, "Cache global functions and constants at the top of the file")
 	flags.BoolVar(&flagOptimizeLoops, "optimize-loops", true, "Refactor generic ipairs loops to numeric loops")
 	flags.BoolVar(&flagConstFold, "const-fold", true, "Perform compile-time optimization of static expressions")
-	flags.IntVar(&flagGlobalThreshold, "global-threshold", 2, "Minimum usage count before a global namespace gets cached")
+	flags.BoolVar(&flagCombineLocals, "combine-locals", true, "Combine consecutive local definitions into a single statement")
+	flags.BoolVar(&flagOptimizeTableInsert, "optimize-table-insert", true, "Refactor table.insert(t, v) to t[#t+1] = v")
+	flags.IntVar(&flagGlobalThreshold, "global-threshold", 1, "Minimum usage count before a global namespace gets cached")
+	flags.IntVar(&flagMaxLocals, "max-locals", 150, "Maximum root-scope locals after global caching; 0 disables the cap")
+	flags.StringSliceVar(&flagReservedNames, "reserved-names", nil, "Comma-separated list of names that should never be used as minified local names")
+	flags.BoolVar(&flagNoShadowAllGlobals, "no-shadow-all-globals", false, "Prevent renaming local variables to any standard Lua global name")
+	flags.BoolVar(&flagNoShadowRefGlobals, "no-shadow-referenced-globals", true, "Prevent renaming local variables to any global name referenced in the script")
 }
 
 func main() {
@@ -142,6 +154,15 @@ func minifySource(src []byte, renameLocals bool) ([]byte, error) {
 
 	resolver := minifier.NewResolver(tree, renameLocals)
 
+	resolver.NoShadowAllGlobals = flagNoShadowAllGlobals
+	resolver.NoShadowRefGlobals = flagNoShadowRefGlobals
+
+	if len(flagReservedNames) > 0 {
+		for _, name := range flagReservedNames {
+			resolver.ReservedNames[name] = true
+		}
+	}
+
 	resolver.Resolve()
 
 	optimizer := minifier.NewOptimizer(
@@ -150,12 +171,24 @@ func minifySource(src []byte, renameLocals bool) ([]byte, error) {
 		flagCacheGlobals,
 		flagOptimizeLoops,
 		flagConstFold,
+		flagCombineLocals,
+		flagOptimizeTableInsert,
 		flagGlobalThreshold,
+		flagMaxLocals,
 	)
 
 	optimizer.Optimize()
 
 	resolver = minifier.NewResolver(tree, renameLocals)
+
+	resolver.NoShadowAllGlobals = flagNoShadowAllGlobals
+	resolver.NoShadowRefGlobals = flagNoShadowRefGlobals
+
+	if len(flagReservedNames) > 0 {
+		for _, name := range flagReservedNames {
+			resolver.ReservedNames[name] = true
+		}
+	}
 
 	resolver.Resolve()
 

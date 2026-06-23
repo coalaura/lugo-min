@@ -1,7 +1,9 @@
 package minifier
 
 import (
+	"bytes"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -10,23 +12,41 @@ import (
 )
 
 type Optimizer struct {
-	tree            *ast.Tree
-	identMap        map[ast.NodeID]*LocalSymbol
-	cacheGlobals    bool
-	optimizeLoops   bool
-	constantFolding bool
-	globalThreshold int
-	iteratorIndex   int
+	tree                *ast.Tree
+	identMap            map[ast.NodeID]*LocalSymbol
+	globalThreshold     int
+	maxLocals           int
+	iteratorIndex       int
+	cacheGlobals        bool
+	optimizeLoops       bool
+	constantFolding     bool
+	combineLocals       bool
+	optimizeTableInsert bool
 }
 
-func NewOptimizer(tree *ast.Tree, identMap map[ast.NodeID]*LocalSymbol, cacheGlobals, optimizeLoops, constantFolding bool, globalThreshold int) *Optimizer {
+func NewOptimizer(tree *ast.Tree, identMap map[ast.NodeID]*LocalSymbol, cacheGlobals, optimizeLoops, constantFolding, combineLocals, optimizeTableInsert bool, globalThreshold, maxLocals int) *Optimizer {
 	return &Optimizer{
-		tree:            tree,
-		identMap:        identMap,
-		cacheGlobals:    cacheGlobals,
-		optimizeLoops:   optimizeLoops,
-		constantFolding: constantFolding,
-		globalThreshold: globalThreshold,
+		tree:                tree,
+		identMap:            identMap,
+		cacheGlobals:        cacheGlobals,
+		optimizeLoops:       optimizeLoops,
+		constantFolding:     constantFolding,
+		combineLocals:       combineLocals,
+		optimizeTableInsert: optimizeTableInsert,
+		globalThreshold:     globalThreshold,
+		maxLocals:           maxLocals,
+	}
+}
+
+func (opt *Optimizer) safeLocalName(prefix string, index *int) string {
+	for {
+		name := prefix + strconv.Itoa(*index)
+
+		*index++
+
+		if !bytes.Contains(opt.tree.Source, []byte(name)) {
+			return name
+		}
 	}
 }
 
@@ -39,8 +59,16 @@ func (opt *Optimizer) Optimize() {
 		opt.optimizeIpairsLoops(opt.tree.Root)
 	}
 
+	if opt.optimizeTableInsert {
+		opt.optimizeTableInsertCalls(opt.tree.Root)
+	}
+
 	if opt.cacheGlobals {
 		opt.performGlobalCaching()
+	}
+
+	if opt.combineLocals {
+		opt.combineLocalDeclarations(opt.tree.Root)
 	}
 }
 
@@ -322,13 +350,10 @@ func (opt *Optimizer) transformIpairsLoop(nodeID ast.NodeID) (cacheDecl, loopNod
 
 	indexName := string(opt.tree.Source[indexVar.Start:indexVar.End])
 
-	opt.iteratorIndex++
-	hexIdx := strconv.FormatInt(int64(opt.iteratorIndex), 16)
-
 	var loopIndexVarID ast.NodeID
 
 	if indexName == "_" {
-		loopIndexName := "idx_" + hexIdx
+		loopIndexName := opt.safeLocalName("idx_", &opt.iteratorIndex)
 
 		start := uint32(len(opt.tree.Source))
 		opt.tree.Source = append(opt.tree.Source, []byte(loopIndexName)...)
@@ -343,7 +368,7 @@ func (opt *Optimizer) transformIpairsLoop(nodeID ast.NodeID) (cacheDecl, loopNod
 		loopIndexVarID = indexVarID
 	}
 
-	iterName := "iter_" + hexIdx
+	iterName := opt.safeLocalName("iter_", &opt.iteratorIndex)
 
 	iterStart := uint32(len(opt.tree.Source))
 	opt.tree.Source = append(opt.tree.Source, []byte(iterName)...)
@@ -400,9 +425,12 @@ func (opt *Optimizer) transformIpairsLoop(nodeID ast.NodeID) (cacheDecl, loopNod
 		End:   startNumEnd,
 	})
 
+	hashStart := uint32(len(opt.tree.Source))
+	opt.tree.Source = append(opt.tree.Source, '#')
+
 	endExprID := opt.tree.AddNode(ast.Node{
 		Kind:  ast.KindUnaryExpr,
-		Start: startNumStart,
+		Start: hashStart,
 		End:   iterEnd,
 		Right: cacheVarID, // #iter_X
 	})
@@ -529,9 +557,11 @@ func (opt *Optimizer) collectGlobals(nodeID ast.NodeID, inWriteContext bool, glo
 
 	node := opt.tree.Nodes[nodeID]
 
+	// only collect global paths if they are evaluated in a read context and are invoked directly as a function call
 	if !inWriteContext && isCallee {
 		if path, ok := opt.getGlobalPath(nodeID); ok {
 			globalUses[path] = append(globalUses[path], nodeID)
+			return
 		}
 	}
 
@@ -563,10 +593,10 @@ func (opt *Optimizer) collectGlobals(nodeID ast.NodeID, inWriteContext bool, glo
 		opt.collectGlobals(node.Left, false, globalUses, false)
 		opt.collectGlobals(node.Right, false, globalUses, false)
 	case ast.KindMemberExpr:
-		opt.collectGlobals(node.Left, inWriteContext, globalUses, false)
+		opt.collectGlobals(node.Left, inWriteContext, globalUses, isCallee)
 		opt.collectGlobals(node.Right, true, globalUses, false)
 	case ast.KindIndexExpr:
-		opt.collectGlobals(node.Left, inWriteContext, globalUses, false)
+		opt.collectGlobals(node.Left, inWriteContext, globalUses, isCallee)
 		opt.collectGlobals(node.Right, false, globalUses, false)
 	case ast.KindMethodCall:
 		opt.collectGlobals(node.Left, inWriteContext, globalUses, false)
@@ -692,7 +722,40 @@ func (opt *Optimizer) markInvalid(nodeID ast.NodeID) {
 	opt.tree.Nodes[nodeID].Kind = ast.KindInvalid
 }
 
+func (opt *Optimizer) countRootLocals() int {
+	rootNode := opt.tree.Nodes[opt.tree.Root]
+	rootBlockID := rootNode.Left
+	if rootBlockID == ast.InvalidNode {
+		return 0
+	}
+
+	rootBlock := opt.tree.Nodes[rootBlockID]
+	count := 0
+
+	for i := range rootBlock.Count {
+		stmtID := opt.tree.ExtraList[rootBlock.Extra+uint32(i)]
+		stmt := opt.tree.Nodes[stmtID]
+
+		if stmt.Kind == ast.KindLocalAssign {
+			if stmt.Left != ast.InvalidNode {
+				count += int(opt.tree.Nodes[stmt.Left].Count)
+			}
+		} else if stmt.Kind == ast.KindLocalFunction {
+			count++
+		}
+	}
+
+	return count
+}
+
 func (opt *Optimizer) performGlobalCaching() {
+	existingLocals := opt.countRootLocals()
+
+	budget := opt.maxLocals - existingLocals
+	if opt.maxLocals > 0 && budget <= 0 {
+		return
+	}
+
 	globalUses := make(map[string][]ast.NodeID)
 
 	opt.collectGlobals(opt.tree.Root, false, globalUses, false)
@@ -709,12 +772,39 @@ func (opt *Optimizer) performGlobalCaching() {
 		}
 	}
 
-	importSort(paths)
+	sort.Slice(paths, func(i, j int) bool {
+		pathI := paths[i]
+		pathJ := paths[j]
+		usesI := len(globalUses[pathI])
+		usesJ := len(globalUses[pathJ])
+
+		scoreI := len(pathI) * usesI
+		scoreJ := len(pathJ) * usesJ
+
+		if scoreI != scoreJ {
+			return scoreI > scoreJ
+		}
+
+		if usesI != usesJ {
+			return usesI > usesJ
+		}
+
+		if len(pathI) != len(pathJ) {
+			return len(pathI) > len(pathJ)
+		}
+
+		return pathI < pathJ
+	})
+
+	if opt.maxLocals > 0 && len(paths) > budget {
+		paths = paths[:budget]
+	}
 
 	for _, path := range paths {
 		uses := globalUses[path]
 
 		var activeUses []ast.NodeID
+
 		for _, u := range uses {
 			if opt.tree.Nodes[u].Kind != ast.KindInvalid {
 				activeUses = append(activeUses, u)
@@ -725,9 +815,7 @@ func (opt *Optimizer) performGlobalCaching() {
 			continue
 		}
 
-		localVarName := "_g" + strconv.Itoa(index)
-
-		index++
+		localVarName := opt.safeLocalName("_g", &index)
 
 		varStart := uint32(len(opt.tree.Source))
 		opt.tree.Source = append(opt.tree.Source, []byte(localVarName)...)
@@ -820,6 +908,496 @@ func (opt *Optimizer) performGlobalCaching() {
 			}
 		}
 	}
+}
+
+func (opt *Optimizer) combineLocalDeclarations(nodeID ast.NodeID) {
+	if nodeID == ast.InvalidNode {
+		return
+	}
+
+	node := opt.tree.Nodes[nodeID]
+
+	if node.Kind == ast.KindBlock {
+		var (
+			newStmts []ast.NodeID
+			changed  bool
+			i        int
+		)
+
+		for i < int(node.Count) {
+			childID := opt.tree.ExtraList[node.Extra+uint32(i)]
+			childNode := opt.tree.Nodes[childID]
+
+			opt.combineLocalDeclarations(childID)
+
+			if childNode.Kind != ast.KindLocalAssign {
+				newStmts = append(newStmts, childID)
+				i++
+				continue
+			}
+
+			group := []ast.NodeID{childID}
+			declaredNames := make(map[string]bool)
+
+			opt.collectDeclaredNames(childID, declaredNames)
+
+			hasRHS := (childNode.Right != ast.InvalidNode)
+			totalVariables := opt.getListNameCount(childNode.Left)
+
+			j := i + 1
+
+			for j < int(node.Count) {
+				nextID := opt.tree.ExtraList[node.Extra+uint32(j)]
+				nextNode := opt.tree.Nodes[nextID]
+
+				opt.combineLocalDeclarations(nextID)
+
+				nextNode = opt.tree.Nodes[nextID]
+
+				if nextNode.Kind != ast.KindLocalAssign {
+					break
+				}
+
+				nextLHSCount := opt.getListNameCount(nextNode.Left)
+				if totalVariables+nextLHSCount > 100 {
+					break
+				}
+
+				nextHasRHS := (nextNode.Right != ast.InvalidNode)
+				if hasRHS != nextHasRHS {
+					break
+				}
+
+				if hasRHS {
+					prevID := group[len(group)-1]
+					prevNode := opt.tree.Nodes[prevID]
+
+					lhsCount := opt.getListNameCount(prevNode.Left)
+					rhsCount := opt.getListExprCount(prevNode.Right)
+
+					if lhsCount != rhsCount {
+						break
+					}
+
+					if opt.hasDependency(nextNode.Right, declaredNames) {
+						break
+					}
+				}
+
+				totalVariables += nextLHSCount
+				group = append(group, nextID)
+				opt.collectDeclaredNames(nextID, declaredNames)
+				j++
+			}
+
+			if len(group) > 1 {
+				mergedID := opt.mergeLocalAssigns(group, hasRHS)
+				newStmts = append(newStmts, mergedID)
+				changed = true
+				i = j
+			} else {
+				newStmts = append(newStmts, childID)
+				i++
+			}
+		}
+
+		if changed {
+			extraStart := uint32(len(opt.tree.ExtraList))
+			opt.tree.ExtraList = append(opt.tree.ExtraList, newStmts...)
+
+			opt.tree.Nodes[nodeID].Extra = extraStart
+			opt.tree.Nodes[nodeID].Count = uint16(len(newStmts))
+
+			for _, child := range newStmts {
+				opt.tree.Nodes[child].Parent = nodeID
+			}
+		}
+	} else {
+		opt.combineLocalDeclarations(node.Left)
+		opt.combineLocalDeclarations(node.Right)
+
+		if node.Count > 0 && node.Kind != ast.KindFile {
+			for i := range node.Count {
+				opt.combineLocalDeclarations(opt.tree.ExtraList[node.Extra+uint32(i)])
+			}
+		}
+	}
+}
+
+func (opt *Optimizer) collectDeclaredNames(localAssignID ast.NodeID, dest map[string]bool) {
+	node := opt.tree.Nodes[localAssignID]
+	if node.Left == ast.InvalidNode {
+		return
+	}
+
+	nameList := opt.tree.Nodes[node.Left]
+
+	for k := range nameList.Count {
+		identID := opt.tree.ExtraList[nameList.Extra+uint32(k)]
+		identNode := opt.tree.Nodes[identID]
+
+		name := string(opt.tree.Source[identNode.Start:identNode.End])
+		dest[name] = true
+	}
+}
+
+func (opt *Optimizer) getListNameCount(nodeID ast.NodeID) int {
+	if nodeID == ast.InvalidNode {
+		return 0
+	}
+
+	return int(opt.tree.Nodes[nodeID].Count)
+}
+
+func (opt *Optimizer) getListExprCount(nodeID ast.NodeID) int {
+	if nodeID == ast.InvalidNode {
+		return 0
+	}
+
+	return int(opt.tree.Nodes[nodeID].Count)
+}
+
+func (opt *Optimizer) mergeLocalAssigns(group []ast.NodeID, hasRHS bool) ast.NodeID {
+	var lhsIdents []ast.NodeID
+
+	for _, assignID := range group {
+		assignNode := opt.tree.Nodes[assignID]
+		nameListNode := opt.tree.Nodes[assignNode.Left]
+
+		for k := range nameListNode.Count {
+			lhsIdents = append(lhsIdents, opt.tree.ExtraList[nameListNode.Extra+uint32(k)])
+		}
+	}
+
+	lhsExtraStart := uint32(len(opt.tree.ExtraList))
+	opt.tree.ExtraList = append(opt.tree.ExtraList, lhsIdents...)
+
+	firstNode := opt.tree.Nodes[group[0]]
+	lastNode := opt.tree.Nodes[group[len(group)-1]]
+
+	lhsNodeID := opt.tree.AddNode(ast.Node{
+		Kind:  ast.KindNameList,
+		Start: opt.tree.Nodes[lhsIdents[0]].Start,
+		End:   opt.tree.Nodes[lhsIdents[len(lhsIdents)-1]].End,
+		Extra: lhsExtraStart,
+		Count: uint16(len(lhsIdents)),
+	})
+
+	rhsNodeID := ast.InvalidNode
+
+	if hasRHS {
+		var rhsExprs []ast.NodeID
+
+		for _, assignID := range group {
+			assignNode := opt.tree.Nodes[assignID]
+			exprListNode := opt.tree.Nodes[assignNode.Right]
+
+			for k := range exprListNode.Count {
+				rhsExprs = append(rhsExprs, opt.tree.ExtraList[exprListNode.Extra+uint32(k)])
+			}
+		}
+
+		rhsExtraStart := uint32(len(opt.tree.ExtraList))
+		opt.tree.ExtraList = append(opt.tree.ExtraList, rhsExprs...)
+
+		rhsNodeID = opt.tree.AddNode(ast.Node{
+			Kind:  ast.KindExprList,
+			Start: opt.tree.Nodes[rhsExprs[0]].Start,
+			End:   opt.tree.Nodes[rhsExprs[len(rhsExprs)-1]].End,
+			Extra: rhsExtraStart,
+			Count: uint16(len(rhsExprs)),
+		})
+	}
+
+	mergedID := opt.tree.AddNode(ast.Node{
+		Kind:  ast.KindLocalAssign,
+		Start: firstNode.Start,
+		End:   lastNode.End,
+		Left:  lhsNodeID,
+		Right: rhsNodeID,
+	})
+
+	return mergedID
+}
+
+func (opt *Optimizer) hasDependency(nodeID ast.NodeID, declaredNames map[string]bool) bool {
+	if nodeID == ast.InvalidNode {
+		return false
+	}
+
+	node := opt.tree.Nodes[nodeID]
+
+	if node.Kind == ast.KindIdent {
+		name := string(opt.tree.Source[node.Start:node.End])
+		if declaredNames[name] {
+			return true
+		}
+	}
+
+	if node.Left != ast.InvalidNode && opt.hasDependency(node.Left, declaredNames) {
+		return true
+	}
+
+	if node.Right != ast.InvalidNode && opt.hasDependency(node.Right, declaredNames) {
+		return true
+	}
+
+	if node.Count > 0 {
+		for i := range node.Count {
+			childID := opt.tree.ExtraList[node.Extra+uint32(i)]
+			if opt.hasDependency(childID, declaredNames) {
+				return true
+			}
+		}
+	}
+
+	if node.Kind == ast.KindForIn && node.Extra != 0 {
+		if opt.hasDependency(ast.NodeID(node.Extra), declaredNames) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (opt *Optimizer) optimizeTableInsertCalls(nodeID ast.NodeID) {
+	if nodeID == ast.InvalidNode {
+		return
+	}
+
+	node := opt.tree.Nodes[nodeID]
+
+	if node.Kind == ast.KindBlock {
+		for i := range node.Count {
+			childID := opt.tree.ExtraList[node.Extra+uint32(i)]
+
+			opt.optimizeTableInsertCalls(childID)
+
+			if opt.isStatement(childID) {
+				if tID, vID, ok := opt.isTableInsertTwoArgsCall(childID); ok {
+					if opt.isSafeToDuplicate(tID) {
+						opt.transformTableInsert(childID, tID, vID)
+					}
+				}
+			}
+		}
+	} else {
+		opt.optimizeTableInsertCalls(node.Left)
+		opt.optimizeTableInsertCalls(node.Right)
+
+		if node.Count > 0 && node.Kind != ast.KindFile {
+			for i := range node.Count {
+				opt.optimizeTableInsertCalls(opt.tree.ExtraList[node.Extra+uint32(i)])
+			}
+		}
+	}
+}
+
+func (opt *Optimizer) isStatement(nodeID ast.NodeID) bool {
+	if nodeID == ast.InvalidNode {
+		return false
+	}
+
+	parentID := opt.tree.Nodes[nodeID].Parent
+	if parentID == ast.InvalidNode {
+		return false
+	}
+
+	return opt.tree.Nodes[parentID].Kind == ast.KindBlock
+}
+
+func (opt *Optimizer) isTableInsertCallee(nodeID ast.NodeID) bool {
+	if nodeID == ast.InvalidNode {
+		return false
+	}
+
+	node := opt.tree.Nodes[nodeID]
+	if node.Kind != ast.KindMemberExpr {
+		return false
+	}
+
+	leftNode := opt.tree.Nodes[node.Left]
+	if leftNode.Kind != ast.KindIdent {
+		return false
+	}
+
+	if string(opt.tree.Source[leftNode.Start:leftNode.End]) != "table" {
+		return false
+	}
+
+	if _, isLocal := opt.identMap[node.Left]; isLocal {
+		return false
+	}
+
+	rightNode := opt.tree.Nodes[node.Right]
+	if rightNode.Kind != ast.KindIdent {
+		return false
+	}
+
+	if string(opt.tree.Source[rightNode.Start:rightNode.End]) != "insert" {
+		return false
+	}
+
+	return true
+}
+
+func (opt *Optimizer) isTableInsertTwoArgsCall(nodeID ast.NodeID) (ast.NodeID, ast.NodeID, bool) {
+	if nodeID == ast.InvalidNode {
+		return ast.InvalidNode, ast.InvalidNode, false
+	}
+
+	node := opt.tree.Nodes[nodeID]
+	if node.Kind != ast.KindCallExpr {
+		return ast.InvalidNode, ast.InvalidNode, false
+	}
+
+	if !opt.isTableInsertCallee(node.Left) {
+		return ast.InvalidNode, ast.InvalidNode, false
+	}
+
+	if node.Count != 2 {
+		return ast.InvalidNode, ast.InvalidNode, false
+	}
+
+	tableArgID := opt.tree.ExtraList[node.Extra]
+	valueArgID := opt.tree.ExtraList[node.Extra+1]
+
+	return tableArgID, valueArgID, true
+}
+
+func (opt *Optimizer) isSafeToDuplicate(nodeID ast.NodeID) bool {
+	if nodeID == ast.InvalidNode {
+		return false
+	}
+
+	node := opt.tree.Nodes[nodeID]
+
+	switch node.Kind {
+	case ast.KindIdent:
+		return true
+	case ast.KindMemberExpr:
+		return opt.isSafeToDuplicate(node.Left) && opt.tree.Nodes[node.Right].Kind == ast.KindIdent
+	case ast.KindIndexExpr:
+		rightNode := opt.tree.Nodes[node.Right]
+
+		return opt.isSafeToDuplicate(node.Left) && (rightNode.Kind == ast.KindString || rightNode.Kind == ast.KindNumber)
+	default:
+		return false
+	}
+}
+
+func (opt *Optimizer) cloneNode(nodeID ast.NodeID) ast.NodeID {
+	if nodeID == ast.InvalidNode {
+		return ast.InvalidNode
+	}
+
+	orig := opt.tree.Nodes[nodeID]
+
+	clone := ast.Node{
+		Kind:  orig.Kind,
+		Start: orig.Start,
+		End:   orig.End,
+		Extra: orig.Extra,
+		Count: orig.Count,
+	}
+
+	clone.Left = opt.cloneNode(orig.Left)
+	clone.Right = opt.cloneNode(orig.Right)
+
+	if orig.Count > 0 && orig.Kind != ast.KindBlock && orig.Kind != ast.KindFile {
+		newExtraStart := uint32(len(opt.tree.ExtraList))
+
+		for i := range orig.Count {
+			childID := opt.tree.ExtraList[orig.Extra+uint32(i)]
+			clonedChildID := opt.cloneNode(childID)
+			opt.tree.ExtraList = append(opt.tree.ExtraList, clonedChildID)
+		}
+
+		clone.Extra = newExtraStart
+	}
+
+	clonedID := opt.tree.AddNode(clone)
+
+	if orig.Kind == ast.KindIdent {
+		if sym, ok := opt.identMap[nodeID]; ok {
+			opt.identMap[clonedID] = sym
+		}
+	}
+
+	return clonedID
+}
+
+func (opt *Optimizer) transformTableInsert(callNodeID, tID, vID ast.NodeID) {
+	startNumStart := uint32(len(opt.tree.Source))
+	opt.tree.Source = append(opt.tree.Source, []byte("1")...)
+	startNumEnd := uint32(len(opt.tree.Source))
+
+	startNumID := opt.tree.AddNode(ast.Node{
+		Kind:  ast.KindNumber,
+		Start: startNumStart,
+		End:   startNumEnd,
+	})
+
+	hashStart := uint32(len(opt.tree.Source))
+	opt.tree.Source = append(opt.tree.Source, '#')
+
+	tClone1 := opt.cloneNode(tID)
+	lenExprID := opt.tree.AddNode(ast.Node{
+		Kind:  ast.KindUnaryExpr,
+		Start: hashStart,
+		End:   opt.tree.Nodes[tClone1].End,
+		Right: tClone1,
+	})
+
+	plusExprID := opt.tree.AddNode(ast.Node{
+		Kind:  ast.KindBinaryExpr,
+		Start: hashStart,
+		End:   opt.tree.Nodes[startNumID].End,
+		Left:  lenExprID,
+		Right: startNumID,
+		Extra: uint32(token.Plus),
+	})
+
+	tClone2 := opt.cloneNode(tID)
+	indexExprID := opt.tree.AddNode(ast.Node{
+		Kind:  ast.KindIndexExpr,
+		Start: opt.tree.Nodes[tClone2].Start,
+		End:   opt.tree.Nodes[plusExprID].End,
+		Left:  tClone2,
+		Right: plusExprID,
+	})
+
+	lhsExtraStart := uint32(len(opt.tree.ExtraList))
+	opt.tree.ExtraList = append(opt.tree.ExtraList, indexExprID)
+	lhsListID := opt.tree.AddNode(ast.Node{
+		Kind:  ast.KindExprList,
+		Start: opt.tree.Nodes[indexExprID].Start,
+		End:   opt.tree.Nodes[indexExprID].End,
+		Extra: lhsExtraStart,
+		Count: 1,
+	})
+
+	rhsExtraStart := uint32(len(opt.tree.ExtraList))
+	opt.tree.ExtraList = append(opt.tree.ExtraList, vID)
+	rhsListID := opt.tree.AddNode(ast.Node{
+		Kind:  ast.KindExprList,
+		Start: opt.tree.Nodes[vID].Start,
+		End:   opt.tree.Nodes[vID].End,
+		Extra: rhsExtraStart,
+		Count: 1,
+	})
+
+	opt.tree.Nodes[callNodeID] = ast.Node{
+		Kind:   ast.KindAssign,
+		Start:  opt.tree.Nodes[lhsListID].Start,
+		End:    opt.tree.Nodes[rhsListID].End,
+		Left:   lhsListID,
+		Right:  rhsListID,
+		Parent: opt.tree.Nodes[callNodeID].Parent,
+	}
+
+	opt.tree.Nodes[lhsListID].Parent = callNodeID
+	opt.tree.Nodes[rhsListID].Parent = callNodeID
 }
 
 func importSort(slice []string) {

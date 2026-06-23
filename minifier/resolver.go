@@ -14,6 +14,18 @@ var luaKeywords = map[string]bool{
 	"until": true, "while": true,
 }
 
+var standardGlobals = map[string]bool{
+	"_G": true, "_VERSION": true, "assert": true, "collectgarbage": true,
+	"dofile": true, "error": true, "getmetatable": true, "ipairs": true,
+	"next": true, "pairs": true, "pcall": true, "print": true,
+	"rawequal": true, "rawget": true, "rawlen": true, "rawset": true,
+	"select": true, "setmetatable": true, "tonumber": true, "tostring": true,
+	"type": true, "xpcall": true, "require": true, "module": true,
+	"package": true, "coroutine": true, "debug": true, "io": true,
+	"math": true, "os": true, "string": true, "table": true, "utf8": true,
+	"self": true,
+}
+
 type LocalSymbol struct {
 	Name         string
 	MinifiedName string
@@ -25,21 +37,39 @@ type Scope struct {
 }
 
 type Resolver struct {
-	Tree         *ast.Tree
-	IdentMap     map[ast.NodeID]*LocalSymbol
-	ScopeChain   *Scope
-	RenameLocals bool
+	Tree               *ast.Tree
+	IdentMap           map[ast.NodeID]*LocalSymbol
+	ScopeChain         *Scope
+	ReferencedGlobals  map[string]bool
+	ReservedNames      map[string]bool
+	RenameLocals       bool
+	NoShadowAllGlobals bool
+	NoShadowRefGlobals bool
+	collectMode        bool
 }
 
 func NewResolver(tree *ast.Tree, renameLocals bool) *Resolver {
 	return &Resolver{
-		Tree:         tree,
-		IdentMap:     make(map[ast.NodeID]*LocalSymbol),
-		RenameLocals: renameLocals,
+		Tree:               tree,
+		IdentMap:           make(map[ast.NodeID]*LocalSymbol),
+		RenameLocals:       renameLocals,
+		ReferencedGlobals:  make(map[string]bool),
+		ReservedNames:      make(map[string]bool),
+		NoShadowRefGlobals: true,
 	}
 }
 
 func (r *Resolver) Resolve() {
+	if r.RenameLocals && r.NoShadowRefGlobals {
+		r.collectMode = true
+		r.walk(r.Tree.Root)
+		r.collectMode = false
+
+		r.ScopeChain = nil
+
+		clear(r.IdentMap)
+	}
+
 	r.walk(r.Tree.Root)
 }
 
@@ -71,7 +101,7 @@ func (r *Resolver) declare(identID ast.NodeID) {
 
 	sym := &LocalSymbol{Name: name}
 
-	if r.RenameLocals {
+	if r.RenameLocals && !r.collectMode {
 		sym.MinifiedName = r.nextAvailableName()
 	} else {
 		sym.MinifiedName = name
@@ -84,7 +114,7 @@ func (r *Resolver) declare(identID ast.NodeID) {
 func (r *Resolver) declareName(name string) {
 	sym := &LocalSymbol{Name: name}
 
-	if r.RenameLocals {
+	if r.RenameLocals && !r.collectMode {
 		sym.MinifiedName = r.nextAvailableName()
 	} else {
 		sym.MinifiedName = name
@@ -112,6 +142,18 @@ func (r *Resolver) nextAvailableName() string {
 		idx++
 
 		if luaKeywords[name] {
+			continue
+		}
+
+		if r.NoShadowAllGlobals && standardGlobals[name] {
+			continue
+		}
+
+		if r.ReservedNames[name] {
+			continue
+		}
+
+		if r.NoShadowRefGlobals && r.ReferencedGlobals[name] {
 			continue
 		}
 
@@ -272,6 +314,8 @@ func (r *Resolver) walk(nodeID ast.NodeID) {
 		sym := r.lookup(name)
 		if sym != nil {
 			r.IdentMap[nodeID] = sym
+		} else if r.collectMode {
+			r.ReferencedGlobals[name] = true
 		}
 	case ast.KindRecordField:
 		// left is a key identifier (not a variable lookup!). only walk value (right).
