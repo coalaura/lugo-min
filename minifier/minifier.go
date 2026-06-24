@@ -2,7 +2,6 @@ package minifier
 
 import (
 	"bytes"
-	"strings"
 
 	"github.com/coalaura/lugo/ast"
 	"github.com/coalaura/lugo/token"
@@ -17,10 +16,14 @@ type Minifier struct {
 }
 
 func NewMinifier(tree *ast.Tree, identMap map[ast.NodeID]*LocalSymbol) *Minifier {
-	return &Minifier{
+	m := &Minifier{
 		Tree:     tree,
 		IdentMap: identMap,
 	}
+
+	m.Buf.Grow(len(tree.Source))
+
+	return m
 }
 
 func (m *Minifier) Minify() []byte {
@@ -43,6 +46,22 @@ func (m *Minifier) Write(s string) {
 	m.Buf.WriteString(s)
 
 	m.LastChar = s[len(s)-1]
+}
+
+func (m *Minifier) WriteBytes(b []byte) {
+	if len(b) == 0 {
+		return
+	}
+
+	first := b[0]
+
+	if (isIdentChar(m.LastChar) && isIdentChar(first)) || (m.LastChar == '-' && first == '-') {
+		m.Buf.WriteByte(' ')
+	}
+
+	m.Buf.Write(b)
+
+	m.LastChar = b[len(b)-1]
 }
 
 func (m *Minifier) WriteByte(b byte) {
@@ -100,18 +119,18 @@ func (m *Minifier) printNode(nodeID ast.NodeID) {
 		if sym, ok := m.IdentMap[nodeID]; ok {
 			m.Write(sym.MinifiedName)
 		} else {
-			m.Write(string(m.Tree.Source[node.Start:node.End]))
+			m.WriteBytes(m.Tree.Source[node.Start:node.End])
 		}
 	case ast.KindNumber:
-		s := string(m.Tree.Source[node.Start:node.End])
+		b := m.Tree.Source[node.Start:node.End]
 
 		if m.ShortenNumbers {
-			s = shortenNumber(s)
+			m.WriteBytes(shortenNumberBytes(b))
+		} else {
+			m.WriteBytes(b)
 		}
-
-		m.Write(s)
 	case ast.KindString:
-		m.Write(string(m.Tree.Source[node.Start:node.End]))
+		m.WriteBytes(m.Tree.Source[node.Start:node.End])
 	case ast.KindNil:
 		m.Write("nil")
 	case ast.KindTrue:
@@ -394,22 +413,22 @@ func operatorString(k token.Kind) string {
 	}
 }
 
-func shortenNumber(s string) string {
-	if len(s) < 3 {
-		return s
+func shortenNumberBytes(b []byte) []byte {
+	if len(b) < 3 {
+		return b
 	}
 
-	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
-		return s
+	if b[0] == '0' && (b[1] == 'x' || b[1] == 'X') {
+		return b
 	}
 
-	if strings.HasPrefix(s, "0.") {
-		return s[1:]
+	if b[0] == '0' && b[1] == '.' {
+		return b[1:]
 	}
 
-	if strings.HasSuffix(s, ".0") && !strings.HasPrefix(s, "0.") {
-		return s[:len(s)-2]
+	if b[len(b)-2] == '.' && b[len(b)-1] == '0' {
+		return b[:len(b)-2]
 	}
 
-	return s
+	return b
 }

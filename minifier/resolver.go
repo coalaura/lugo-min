@@ -2,6 +2,7 @@ package minifier
 
 import (
 	"github.com/coalaura/lugo/ast"
+	"github.com/coalaura/lugo/utils"
 )
 
 const Alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -26,26 +27,31 @@ var standardGlobals = map[string]bool{
 	"self": true,
 }
 
+var minifiedNamesCache [1024]string
+
 type LocalSymbol struct {
 	Name         string
 	MinifiedName string
 }
 
-type Scope struct {
-	Parent *Scope
-	Vars   map[string]*LocalSymbol
+type LocalSymbolEntry struct {
+	Name string
+	Sym  *LocalSymbol
 }
 
 type Resolver struct {
 	Tree               *ast.Tree
 	IdentMap           map[ast.NodeID]*LocalSymbol
-	ScopeChain         *Scope
 	ReferencedGlobals  map[string]bool
 	ReservedNames      map[string]bool
 	RenameLocals       bool
 	NoShadowAllGlobals bool
 	NoShadowRefGlobals bool
 	collectMode        bool
+
+	scopes     []int
+	vars       []LocalSymbolEntry
+	activeUsed map[string]uint32
 }
 
 func NewResolver(tree *ast.Tree, renameLocals bool) *Resolver {
@@ -56,6 +62,9 @@ func NewResolver(tree *ast.Tree, renameLocals bool) *Resolver {
 		ReferencedGlobals:  make(map[string]bool),
 		ReservedNames:      make(map[string]bool),
 		NoShadowRefGlobals: true,
+		activeUsed:         make(map[string]uint32),
+		vars:               make([]LocalSymbolEntry, 0, 128),
+		scopes:             make([]int, 0, 32),
 	}
 }
 
@@ -65,7 +74,9 @@ func (r *Resolver) Resolve() {
 		r.walk(r.Tree.Root)
 		r.collectMode = false
 
-		r.ScopeChain = nil
+		r.scopes = r.scopes[:0]
+		r.vars = r.vars[:0]
+		clear(r.activeUsed)
 
 		clear(r.IdentMap)
 	}
@@ -74,16 +85,18 @@ func (r *Resolver) Resolve() {
 }
 
 func (r *Resolver) pushScope() {
-	r.ScopeChain = &Scope{
-		Parent: r.ScopeChain,
-		Vars:   make(map[string]*LocalSymbol),
-	}
+	r.scopes = append(r.scopes, len(r.vars))
 }
 
 func (r *Resolver) popScope() {
-	if r.ScopeChain != nil {
-		r.ScopeChain = r.ScopeChain.Parent
+	startIdx := r.scopes[len(r.scopes)-1]
+	r.scopes = r.scopes[:len(r.scopes)-1]
+
+	for i := startIdx; i < len(r.vars); i++ {
+		sym := r.vars[i].Sym
+		r.activeUsed[sym.MinifiedName]--
 	}
+	r.vars = r.vars[:startIdx]
 }
 
 func (r *Resolver) declare(identID ast.NodeID) {
@@ -97,7 +110,7 @@ func (r *Resolver) declare(identID ast.NodeID) {
 		return
 	}
 
-	name := string(r.Tree.Source[node.Start:node.End])
+	name := utils.String(r.Tree.Source[node.Start:node.End])
 
 	sym := &LocalSymbol{Name: name}
 
@@ -107,7 +120,8 @@ func (r *Resolver) declare(identID ast.NodeID) {
 		sym.MinifiedName = name
 	}
 
-	r.ScopeChain.Vars[name] = sym
+	r.vars = append(r.vars, LocalSymbolEntry{Name: name, Sym: sym})
+	r.activeUsed[sym.MinifiedName]++
 	r.IdentMap[identID] = sym
 }
 
@@ -120,13 +134,14 @@ func (r *Resolver) declareName(name string) {
 		sym.MinifiedName = name
 	}
 
-	r.ScopeChain.Vars[name] = sym
+	r.vars = append(r.vars, LocalSymbolEntry{Name: name, Sym: sym})
+	r.activeUsed[sym.MinifiedName]++
 }
 
 func (r *Resolver) lookup(name string) *LocalSymbol {
-	for s := r.ScopeChain; s != nil; s = s.Parent {
-		if sym, ok := s.Vars[name]; ok {
-			return sym
+	for i := len(r.vars) - 1; i >= 0; i-- {
+		if r.vars[i].Name == name {
+			return r.vars[i].Sym
 		}
 	}
 
@@ -157,33 +172,48 @@ func (r *Resolver) nextAvailableName() string {
 			continue
 		}
 
-		var used bool
+		if r.activeUsed[name] > 0 {
+			continue
+		}
 
-		for s := r.ScopeChain; s != nil; s = s.Parent {
-			for _, sym := range s.Vars {
-				if sym.MinifiedName == name {
-					used = true
+		return name
+	}
+}
 
-					break
-				}
-			}
+func init() {
+	for i := range minifiedNamesCache {
+		var buf [8]byte
 
-			if used {
+		idx := 8
+		val := i
+
+		for {
+			idx--
+			buf[idx] = Alphabet[val%len(Alphabet)]
+
+			val /= len(Alphabet)
+			if val == 0 {
 				break
 			}
 		}
 
-		if !used {
-			return name
-		}
+		minifiedNamesCache[i] = string(buf[idx:])
 	}
 }
 
 func getMinifiedName(index int) string {
-	var buf []byte
+	if index < len(minifiedNamesCache) {
+		return minifiedNamesCache[index]
+	}
+
+	var buf [8]byte
+
+	i := 8
 
 	for {
-		buf = append(buf, Alphabet[index%len(Alphabet)])
+		i--
+
+		buf[i] = Alphabet[index%len(Alphabet)]
 
 		index /= len(Alphabet)
 		if index == 0 {
@@ -191,12 +221,7 @@ func getMinifiedName(index int) string {
 		}
 	}
 
-	// reverse back to correct reading order
-	for i, j := 0, len(buf)-1; i < j; i, j = i+1, j-1 {
-		buf[i], buf[j] = buf[j], buf[i]
-	}
-
-	return string(buf)
+	return string(buf[i:])
 }
 
 func (r *Resolver) walk(nodeID ast.NodeID) {
@@ -309,13 +334,13 @@ func (r *Resolver) walk(nodeID ast.NodeID) {
 	case ast.KindFunctionExpr:
 		r.walkFunctionBody(nodeID, false)
 	case ast.KindIdent:
-		name := string(r.Tree.Source[node.Start:node.End])
+		b := r.Tree.Source[node.Start:node.End]
 
-		sym := r.lookup(name)
+		sym := r.lookup(utils.String(b))
 		if sym != nil {
 			r.IdentMap[nodeID] = sym
 		} else if r.collectMode {
-			r.ReferencedGlobals[name] = true
+			r.ReferencedGlobals[string(b)] = true
 		}
 	case ast.KindRecordField:
 		// left is a key identifier (not a variable lookup!). only walk value (right).

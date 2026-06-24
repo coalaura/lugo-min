@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/coalaura/lugo-min/minifier"
 
@@ -150,6 +151,8 @@ func main() {
 }
 
 func runMinify(ctx context.Context, cmd *cli.Command) error {
+	start := time.Now()
+
 	var eventState *minifier.EventState
 
 	if cmd.Bool("obfuscate-events") {
@@ -166,9 +169,9 @@ func runMinify(ctx context.Context, cmd *cli.Command) error {
 		eventState = minifier.NewEventState(functions)
 	}
 
-	args := cmd.Args().Slice()
+	rawArgs := cmd.Args().Slice()
 
-	if len(args) == 0 {
+	if len(rawArgs) == 0 {
 		src, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return fmt.Errorf("failed to read from stdin: %w", err)
@@ -181,6 +184,46 @@ func runMinify(ctx context.Context, cmd *cli.Command) error {
 
 		_, err = os.Stdout.Write(out)
 		return err
+	}
+
+	var args []string
+
+	for _, arg := range rawArgs {
+		info, err := os.Stat(arg)
+		if err != nil {
+			return fmt.Errorf("failed to stat %s: %w", arg, err)
+		}
+
+		if !info.IsDir() {
+			args = append(args, arg)
+
+			continue
+		}
+
+		err = filepath.WalkDir(arg, func(path string, dir os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+
+			if dir.IsDir() {
+				name := dir.Name()
+				if name == ".git" || name == "node_modules" {
+					return filepath.SkipDir
+				}
+
+				return nil
+			}
+
+			if filepath.Ext(path) == ".lua" {
+				args = append(args, path)
+			}
+
+			return nil
+		})
+
+		if err != nil {
+			return fmt.Errorf("failed to walk directory %s: %w", arg, err)
+		}
 	}
 
 	for _, file := range args {
@@ -238,13 +281,17 @@ func runMinify(ctx context.Context, cmd *cli.Command) error {
 		}
 	}
 
+	fmt.Printf("time: %s\n", time.Since(start))
+
 	if eventState != nil {
-		data, err := json.MarshalIndent(eventState.Map, "", "  ")
+		fmt.Print("events: ")
+
+		err := json.NewEncoder(os.Stdout).Encode(eventState.Map)
 		if err != nil {
 			return fmt.Errorf("failed to marshal event map: %w", err)
 		}
 
-		fmt.Println(string(data))
+		fmt.Println()
 	}
 
 	return nil

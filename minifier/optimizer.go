@@ -9,6 +9,7 @@ import (
 
 	"github.com/coalaura/lugo/ast"
 	"github.com/coalaura/lugo/token"
+	"github.com/coalaura/lugo/utils"
 )
 
 var DefaultEventFunctions = []string{
@@ -104,13 +105,16 @@ func NewOptimizer(tree *ast.Tree, identMap map[ast.NodeID]*LocalSymbol, eventSta
 }
 
 func (opt *Optimizer) safeLocalName(prefix string, index *int) string {
+	var buf []byte
+
 	for {
-		name := prefix + strconv.Itoa(*index)
+		buf = append(buf[:0], prefix...)
+		buf = strconv.AppendInt(buf, int64(*index), 10)
 
 		*index++
 
-		if !bytes.Contains(opt.tree.Source, []byte(name)) {
-			return name
+		if !bytes.Contains(opt.tree.Source, buf) {
+			return string(buf)
 		}
 	}
 }
@@ -249,11 +253,7 @@ func (opt *Optimizer) foldConstants(nodeID ast.NodeID) {
 			case token.BitOr:
 				resVal = float64(int64(leftVal) | int64(rightVal))
 			case token.BitAnd:
-				if uint64(rightVal) == 0xFFFFFFFF {
-					resVal = float64(uint32(int64(leftVal)))
-				} else {
-					resVal = float64(int64(leftVal) & int64(rightVal))
-				}
+				resVal = float64(int64(leftVal) & int64(rightVal))
 			case token.BitXor:
 				resVal = float64(int64(leftVal) ^ int64(rightVal))
 			case token.ShiftLeft:
@@ -297,16 +297,14 @@ func (opt *Optimizer) foldConstants(nodeID ast.NodeID) {
 						Parent: node.Parent,
 					}
 				} else {
-					var str string
+					start := uint32(len(opt.tree.Source))
 
 					if resVal == math.Floor(resVal) && resVal >= math.MinInt64 && resVal <= math.MaxInt64 {
-						str = strconv.FormatInt(int64(resVal), 10)
+						opt.tree.Source = strconv.AppendInt(opt.tree.Source, int64(resVal), 10)
 					} else {
-						str = strconv.FormatFloat(resVal, 'g', -1, 64)
+						opt.tree.Source = strconv.AppendFloat(opt.tree.Source, resVal, 'g', -1, 64)
 					}
 
-					start := uint32(len(opt.tree.Source))
-					opt.tree.Source = append(opt.tree.Source, []byte(str)...)
 					end := uint32(len(opt.tree.Source))
 
 					opt.tree.Nodes[nodeID] = ast.Node{
@@ -331,7 +329,7 @@ func (opt *Optimizer) parseNumber(nodeID ast.NodeID) (float64, bool) {
 		return 0, false
 	}
 
-	src := string(opt.tree.Source[node.Start:node.End])
+	src := utils.String(opt.tree.Source[node.Start:node.End])
 
 	if val, err := strconv.ParseInt(src, 0, 64); err == nil {
 		return float64(val), true
@@ -472,7 +470,7 @@ func (opt *Optimizer) transformIpairsLoop(nodeID ast.NodeID) (cacheDecl, loopNod
 		loopIndexName := opt.safeLocalName("idx_", &opt.iteratorIndex)
 
 		start := uint32(len(opt.tree.Source))
-		opt.tree.Source = append(opt.tree.Source, []byte(loopIndexName)...)
+		opt.tree.Source = append(opt.tree.Source, loopIndexName...)
 		end := uint32(len(opt.tree.Source))
 
 		loopIndexVarID = opt.tree.AddNode(ast.Node{
@@ -487,7 +485,7 @@ func (opt *Optimizer) transformIpairsLoop(nodeID ast.NodeID) (cacheDecl, loopNod
 	iterName := opt.safeLocalName("iter_", &opt.iteratorIndex)
 
 	iterStart := uint32(len(opt.tree.Source))
-	opt.tree.Source = append(opt.tree.Source, []byte(iterName)...)
+	opt.tree.Source = append(opt.tree.Source, iterName...)
 	iterEnd := uint32(len(opt.tree.Source))
 
 	cacheVarID := opt.tree.AddNode(ast.Node{
@@ -532,7 +530,7 @@ func (opt *Optimizer) transformIpairsLoop(nodeID ast.NodeID) (cacheDecl, loopNod
 	})
 
 	startNumStart := uint32(len(opt.tree.Source))
-	opt.tree.Source = append(opt.tree.Source, []byte("1")...)
+	opt.tree.Source = append(opt.tree.Source, "1"...)
 	startNumEnd := uint32(len(opt.tree.Source))
 
 	startNumID := opt.tree.AddNode(ast.Node{
@@ -637,9 +635,9 @@ func (opt *Optimizer) getGlobalPath(nodeID ast.NodeID) (string, bool) {
 			return "", false
 		}
 
-		name := string(opt.tree.Source[node.Start:node.End])
+		name := utils.String(opt.tree.Source[node.Start:node.End])
 
-		// Do not collect compiler-generated helper/iterator variables
+		// do not collect compiler-generated helper/iterator variables
 		if strings.HasPrefix(name, "iter_") || strings.HasPrefix(name, "idx_") || strings.HasPrefix(name, "_g") {
 			return "", false
 		}
@@ -658,7 +656,7 @@ func (opt *Optimizer) getGlobalPath(nodeID ast.NodeID) (string, bool) {
 			return "", false
 		}
 
-		rightName := string(opt.tree.Source[rightNode.Start:rightNode.End])
+		rightName := utils.String(opt.tree.Source[rightNode.Start:rightNode.End])
 
 		return leftPath + "." + rightName, true
 	}
@@ -794,7 +792,7 @@ func (opt *Optimizer) buildGlobalPathNode(path string) ast.NodeID {
 
 	for i, part := range parts {
 		start := uint32(len(opt.tree.Source))
-		opt.tree.Source = append(opt.tree.Source, []byte(part)...)
+		opt.tree.Source = append(opt.tree.Source, part...)
 		end := uint32(len(opt.tree.Source))
 
 		ident := opt.tree.AddNode(ast.Node{
@@ -879,8 +877,9 @@ func (opt *Optimizer) performGlobalCaching() {
 	var (
 		localAssigns []ast.NodeID
 		index        int
-		paths        []string
 	)
+
+	paths := make([]string, 0, len(globalUses))
 
 	for path, uses := range globalUses {
 		if len(uses) >= opt.globalThreshold {
@@ -934,7 +933,7 @@ func (opt *Optimizer) performGlobalCaching() {
 		localVarName := opt.safeLocalName("_g", &index)
 
 		varStart := uint32(len(opt.tree.Source))
-		opt.tree.Source = append(opt.tree.Source, []byte(localVarName)...)
+		opt.tree.Source = append(opt.tree.Source, localVarName...)
 		varEnd := uint32(len(opt.tree.Source))
 
 		identID := opt.tree.AddNode(ast.Node{
@@ -1244,8 +1243,7 @@ func (opt *Optimizer) hasDependency(nodeID ast.NodeID, declaredNames map[string]
 	node := opt.tree.Nodes[nodeID]
 
 	if node.Kind == ast.KindIdent {
-		name := string(opt.tree.Source[node.Start:node.End])
-		if declaredNames[name] {
+		if declaredNames[utils.String(opt.tree.Source[node.Start:node.End])] {
 			return true
 		}
 	}
@@ -1445,7 +1443,7 @@ func (opt *Optimizer) cloneNode(nodeID ast.NodeID) ast.NodeID {
 
 func (opt *Optimizer) transformTableInsert(callNodeID, tID, vID ast.NodeID) {
 	startNumStart := uint32(len(opt.tree.Source))
-	opt.tree.Source = append(opt.tree.Source, []byte("1")...)
+	opt.tree.Source = append(opt.tree.Source, "1"...)
 	startNumEnd := uint32(len(opt.tree.Source))
 
 	startNumID := opt.tree.AddNode(ast.Node{
@@ -1535,10 +1533,10 @@ func (opt *Optimizer) collectEventNames(nodeID ast.NodeID) {
 				argNode := opt.tree.Nodes[argID]
 
 				if argNode.Kind == ast.KindString && argNode.End > argNode.Start+1 && opt.tree.Source[argNode.Start] != '[' {
-					originalName := string(opt.tree.Source[argNode.Start+1 : argNode.End-1])
+					originalBytes := opt.tree.Source[argNode.Start+1 : argNode.End-1]
 
-					if _, exists := opt.eventState.Map[originalName]; !exists {
-						opt.eventState.Map[originalName] = opt.nextEventName()
+					if _, exists := opt.eventState.Map[string(originalBytes)]; !exists {
+						opt.eventState.Map[string(originalBytes)] = opt.nextEventName()
 					}
 				}
 			}
@@ -1576,12 +1574,10 @@ func (opt *Optimizer) replaceEventStrings(nodeID ast.NodeID, skip bool) {
 
 	if node.Kind == ast.KindString && node.End > node.Start+1 && opt.tree.Source[node.Start] != '[' {
 		if !skip {
-			content := string(opt.tree.Source[node.Start+1 : node.End-1])
-
-			if minified, ok := opt.eventState.Map[content]; ok {
+			if minified, ok := opt.eventState.Map[string(opt.tree.Source[node.Start+1:node.End-1])]; ok {
 				newStr := `"` + minified + `"`
 				start := uint32(len(opt.tree.Source))
-				opt.tree.Source = append(opt.tree.Source, []byte(newStr)...)
+				opt.tree.Source = append(opt.tree.Source, newStr...)
 				end := uint32(len(opt.tree.Source))
 
 				opt.tree.Nodes[nodeID] = ast.Node{
@@ -1630,7 +1626,7 @@ func (opt *Optimizer) getCallName(nodeID ast.NodeID) (string, bool) {
 				return "", false
 			}
 
-			return string(opt.tree.Source[callee.Start:callee.End]), true
+			return utils.String(opt.tree.Source[callee.Start:callee.End]), true
 		}
 
 		// match by name without local checks
@@ -1646,7 +1642,8 @@ func (opt *Optimizer) getCallName(nodeID ast.NodeID) (string, bool) {
 			return "", false
 		}
 
-		rightName := string(opt.tree.Source[rightNode.Start:rightNode.End])
+		rightName := utils.String(opt.tree.Source[rightNode.Start:rightNode.End])
+
 		return leftPath + ":" + rightName, true
 	}
 
@@ -1662,7 +1659,7 @@ func (opt *Optimizer) getCalleePath(nodeID ast.NodeID) (string, bool) {
 
 	switch node.Kind {
 	case ast.KindIdent:
-		return string(opt.tree.Source[node.Start:node.End]), true
+		return utils.String(opt.tree.Source[node.Start:node.End]), true
 	case ast.KindMemberExpr:
 		leftPath, ok := opt.getCalleePath(node.Left)
 		if !ok {
@@ -1674,7 +1671,8 @@ func (opt *Optimizer) getCalleePath(nodeID ast.NodeID) (string, bool) {
 			return "", false
 		}
 
-		rightName := string(opt.tree.Source[rightNode.Start:rightNode.End])
+		rightName := utils.String(opt.tree.Source[rightNode.Start:rightNode.End])
+
 		return leftPath + "." + rightName, true
 	}
 
@@ -1704,7 +1702,8 @@ func (opt *Optimizer) treeSignature() uint64 {
 	var h uint64
 
 	for i := range opt.tree.Nodes {
-		n := opt.tree.Nodes[i]
+		n := &opt.tree.Nodes[i]
+
 		h = h*31 + uint64(n.Kind)
 		h = h*31 + uint64(n.Left)
 		h = h*31 + uint64(n.Right)
@@ -1775,16 +1774,13 @@ func (opt *Optimizer) tryFoldStringConcat(nodeID ast.NodeID, node ast.Node) bool
 		return false
 	}
 
-	if bytes.Contains(leftRaw, []byte{'\\'}) || bytes.Contains(rightRaw, []byte{'\\'}) {
+	if bytes.IndexByte(leftRaw, '\\') != -1 || bytes.IndexByte(rightRaw, '\\') != -1 {
 		return false
 	}
 
-	combined := make([]byte, 0, len(leftRaw)+len(rightRaw)-2)
-	combined = append(combined, leftRaw[:len(leftRaw)-1]...)
-	combined = append(combined, rightRaw[1:]...)
-
 	start := uint32(len(opt.tree.Source))
-	opt.tree.Source = append(opt.tree.Source, combined...)
+	opt.tree.Source = append(opt.tree.Source, leftRaw[:len(leftRaw)-1]...)
+	opt.tree.Source = append(opt.tree.Source, rightRaw[1:]...)
 	end := uint32(len(opt.tree.Source))
 
 	opt.tree.Nodes[nodeID] = ast.Node{
@@ -1841,16 +1837,14 @@ func (opt *Optimizer) tryFoldUnaryExpr(nodeID ast.NodeID, node ast.Node) {
 
 			if ok {
 				resVal := -val
-				var str string
+				start := uint32(len(opt.tree.Source))
 
 				if resVal == math.Floor(resVal) && resVal >= math.MinInt64 && resVal <= math.MaxInt64 {
-					str = strconv.FormatInt(int64(resVal), 10)
+					opt.tree.Source = strconv.AppendInt(opt.tree.Source, int64(resVal), 10)
 				} else {
-					str = strconv.FormatFloat(resVal, 'g', -1, 64)
+					opt.tree.Source = strconv.AppendFloat(opt.tree.Source, resVal, 'g', -1, 64)
 				}
 
-				start := uint32(len(opt.tree.Source))
-				opt.tree.Source = append(opt.tree.Source, []byte(str)...)
 				end := uint32(len(opt.tree.Source))
 
 				opt.tree.Nodes[nodeID] = ast.Node{
@@ -1900,10 +1894,9 @@ func (opt *Optimizer) tryFoldUnaryExpr(nodeID ast.NodeID, node ast.Node) {
 			if quote == '"' || quote == '\'' {
 				content := opt.tree.Source[operandNode.Start+1 : operandNode.End-1]
 
-				if !bytes.Contains(content, []byte{'\\'}) {
-					str := strconv.Itoa(len(content))
+				if bytes.IndexByte(content, '\\') == -1 {
 					start := uint32(len(opt.tree.Source))
-					opt.tree.Source = append(opt.tree.Source, []byte(str)...)
+					opt.tree.Source = strconv.AppendInt(opt.tree.Source, int64(len(content)), 10)
 					end := uint32(len(opt.tree.Source))
 
 					opt.tree.Nodes[nodeID] = ast.Node{
@@ -1951,9 +1944,7 @@ func (opt *Optimizer) foldGetHashKeyCalls(nodeID ast.NodeID) {
 
 		if calleeNode.Kind == ast.KindIdent {
 			if _, isLocal := opt.identMap[node.Left]; !isLocal {
-				calleeName := string(opt.tree.Source[calleeNode.Start:calleeNode.End])
-
-				if calleeName == "GetHashKey" && node.Count == 1 {
+				if string(opt.tree.Source[calleeNode.Start:calleeNode.End]) == "GetHashKey" && node.Count == 1 {
 					argID := opt.tree.ExtraList[node.Extra]
 					argNode := opt.tree.Nodes[argID]
 
@@ -1961,12 +1952,11 @@ func (opt *Optimizer) foldGetHashKeyCalls(nodeID ast.NodeID) {
 						quote := opt.tree.Source[argNode.Start]
 
 						if quote == '"' || quote == '\'' {
-							content := string(opt.tree.Source[argNode.Start+1 : argNode.End-1])
+							content := opt.tree.Source[argNode.Start+1 : argNode.End-1]
 							hash := joaat(content)
-							str := strconv.FormatInt(int64(hash), 10)
 
 							start := uint32(len(opt.tree.Source))
-							opt.tree.Source = append(opt.tree.Source, []byte(str)...)
+							opt.tree.Source = strconv.AppendInt(opt.tree.Source, int64(hash), 10)
 							end := uint32(len(opt.tree.Source))
 
 							opt.tree.Nodes[nodeID] = ast.Node{
@@ -2278,15 +2268,16 @@ func (opt *Optimizer) simplifyCitizenCalls(nodeID ast.NodeID) {
 
 			if baseNode.Kind == ast.KindIdent && rightNode.Kind == ast.KindIdent {
 				if _, isLocal := opt.identMap[calleeNode.Left]; !isLocal {
-					baseName := string(opt.tree.Source[baseNode.Start:baseNode.End])
-					rightName := string(opt.tree.Source[rightNode.Start:rightNode.End])
+					if string(opt.tree.Source[baseNode.Start:baseNode.End]) == "Citizen" {
+						rightName := utils.String(opt.tree.Source[rightNode.Start:rightNode.End])
 
-					if baseName == "Citizen" && (rightName == "Wait" || rightName == "CreateThread") {
-						opt.tree.Nodes[node.Left] = ast.Node{
-							Kind:   ast.KindIdent,
-							Start:  rightNode.Start,
-							End:    rightNode.End,
-							Parent: nodeID,
+						if rightName == "Wait" || rightName == "CreateThread" {
+							opt.tree.Nodes[node.Left] = ast.Node{
+								Kind:   ast.KindIdent,
+								Start:  rightNode.Start,
+								End:    rightNode.End,
+								Parent: nodeID,
+							}
 						}
 					}
 				}
@@ -2328,11 +2319,9 @@ func (opt *Optimizer) renameCallTargets(nodeID ast.NodeID) {
 
 		if calleeNode.Kind == ast.KindIdent {
 			if _, isLocal := opt.identMap[node.Left]; !isLocal {
-				name := string(opt.tree.Source[calleeNode.Start:calleeNode.End])
-
-				if newName, ok := opt.renameCalls[name]; ok {
+				if newName, ok := opt.renameCalls[utils.String(opt.tree.Source[calleeNode.Start:calleeNode.End])]; ok {
 					start := uint32(len(opt.tree.Source))
-					opt.tree.Source = append(opt.tree.Source, []byte(newName)...)
+					opt.tree.Source = append(opt.tree.Source, newName...)
 					end := uint32(len(opt.tree.Source))
 
 					opt.tree.Nodes[node.Left] = ast.Node{
@@ -2347,13 +2336,16 @@ func (opt *Optimizer) renameCallTargets(nodeID ast.NodeID) {
 	}
 }
 
-func joaat(s string) int32 {
-	s = strings.ToLower(s)
+func joaat(b []byte) int32 {
+	var h uint32
 
-	h := uint32(0)
+	for i := 0; i < len(b); i++ {
+		c := b[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
 
-	for i := 0; i < len(s); i++ {
-		h += uint32(s[i])
+		h += uint32(c)
 		h += h << 10
 		h ^= h >> 6
 	}
