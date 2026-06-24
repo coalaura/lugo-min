@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/coalaura/lugo-min/minifier"
 
@@ -91,6 +92,50 @@ var command = &cli.Command{
 		&cli.StringSliceFlag{
 			Name:  "event-functions",
 			Usage: "Comma-separated list of additional event functions beyond the defaults",
+		},
+		&cli.BoolFlag{
+			Name:  "shorten-numbers",
+			Usage: "Shorten numeric literals (0.5 -> .5, 5.0 -> 5)",
+			Value: true,
+		},
+		&cli.BoolFlag{
+			Name:  "fold-gethashkey",
+			Usage: "Fold GetHashKey(\"string\") calls to their JOAAT hash at compile time",
+		},
+		&cli.BoolFlag{
+			Name:  "simplify-citizen",
+			Usage: "Simplify Citizen.Wait(x) to Wait(x) and Citizen.CreateThread(f) to CreateThread(f)",
+		},
+		&cli.BoolFlag{
+			Name:  "fixpoint",
+			Usage: "Run optimization passes repeatedly until no more changes are detected",
+			Value: true,
+		},
+		&cli.BoolFlag{
+			Name:  "fold-string-concat",
+			Usage: "Fold constant string concatenation (\"a\" .. \"b\" -> \"ab\")",
+			Value: true,
+		},
+		&cli.BoolFlag{
+			Name:  "fold-unary",
+			Usage: "Fold constant unary expressions (not true -> false, -(-x) -> x, #\"str\" -> len)",
+			Value: true,
+		},
+		&cli.BoolFlag{
+			Name:  "fold-logical",
+			Usage: "Fold logical short-circuit expressions (true and x -> x, false or x -> x)",
+		},
+		&cli.BoolFlag{
+			Name:  "dead-code",
+			Usage: "Eliminate dead code (unreachable statements, if false then ... end)",
+		},
+		&cli.StringSliceFlag{
+			Name:  "rename-calls",
+			Usage: "Rename function calls (old=new,old2=new2)",
+		},
+		&cli.StringSliceFlag{
+			Name:  "skip-event-strings-in",
+			Usage: "Comma-separated list of function names where event string replacement should be skipped",
 		},
 	},
 	Action: runMinify,
@@ -231,18 +276,43 @@ func minifySource(cmd *cli.Command, src []byte, renameLocals bool, eventState *m
 
 	resolver.Resolve()
 
-	optimizer := minifier.NewOptimizer(
-		tree,
-		resolver.IdentMap,
-		eventState,
-		cmd.Bool("cache-globals"),
-		cmd.Bool("optimize-loops"),
-		cmd.Bool("const-fold"),
-		cmd.Bool("combine-locals"),
-		cmd.Bool("optimize-table-insert"),
-		cmd.Int("global-threshold"),
-		cmd.Int("max-locals"),
-	)
+	renameCalls := make(map[string]string)
+
+	for _, pair := range cmd.StringSlice("rename-calls") {
+		parts := strings.SplitN(pair, "=", 2)
+
+		if len(parts) == 2 {
+			renameCalls[parts[0]] = parts[1]
+		}
+	}
+
+	skipEventContexts := make(map[string]bool)
+
+	for _, name := range cmd.StringSlice("skip-event-strings-in") {
+		skipEventContexts[name] = true
+	}
+
+	opts := minifier.OptimizerOptions{
+		CacheGlobals:        cmd.Bool("cache-globals"),
+		OptimizeLoops:       cmd.Bool("optimize-loops"),
+		ConstantFolding:     cmd.Bool("const-fold"),
+		CombineLocals:       cmd.Bool("combine-locals"),
+		OptimizeTableInsert: cmd.Bool("optimize-table-insert"),
+		GlobalThreshold:     cmd.Int("global-threshold"),
+		MaxLocals:           cmd.Int("max-locals"),
+
+		FoldGetHashKey:    cmd.Bool("fold-gethashkey"),
+		SimplifyCitizen:   cmd.Bool("simplify-citizen"),
+		Fixpoint:          cmd.Bool("fixpoint"),
+		FoldStringConcat:  cmd.Bool("fold-string-concat"),
+		FoldUnary:         cmd.Bool("fold-unary"),
+		FoldLogical:       cmd.Bool("fold-logical"),
+		DeadCode:          cmd.Bool("dead-code"),
+		RenameCalls:       renameCalls,
+		SkipEventContexts: skipEventContexts,
+	}
+
+	optimizer := minifier.NewOptimizer(tree, resolver.IdentMap, eventState, opts)
 
 	optimizer.Optimize()
 
@@ -258,6 +328,8 @@ func minifySource(cmd *cli.Command, src []byte, renameLocals bool, eventState *m
 	resolver.Resolve()
 
 	printer := minifier.NewMinifier(tree, resolver.IdentMap)
+
+	printer.ShortenNumbers = cmd.Bool("shorten-numbers")
 
 	return printer.Minify(), nil
 }

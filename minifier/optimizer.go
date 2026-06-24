@@ -27,6 +27,26 @@ type EventState struct {
 	Counter   int
 }
 
+type OptimizerOptions struct {
+	CacheGlobals        bool
+	OptimizeLoops       bool
+	ConstantFolding     bool
+	CombineLocals       bool
+	OptimizeTableInsert bool
+	GlobalThreshold     int
+	MaxLocals           int
+
+	FoldGetHashKey    bool
+	SimplifyCitizen   bool
+	Fixpoint          bool
+	FoldStringConcat  bool
+	FoldUnary         bool
+	FoldLogical       bool
+	DeadCode          bool
+	RenameCalls       map[string]string
+	SkipEventContexts map[string]bool
+}
+
 type Optimizer struct {
 	tree                *ast.Tree
 	identMap            map[ast.NodeID]*LocalSymbol
@@ -39,6 +59,16 @@ type Optimizer struct {
 	constantFolding     bool
 	combineLocals       bool
 	optimizeTableInsert bool
+
+	foldGetHashKey    bool
+	simplifyCitizen   bool
+	fixpoint          bool
+	foldStringConcat  bool
+	foldUnary         bool
+	foldLogical       bool
+	deadCode          bool
+	renameCalls       map[string]string
+	skipEventContexts map[string]bool
 }
 
 func NewEventState(functions map[string]bool) *EventState {
@@ -48,18 +78,28 @@ func NewEventState(functions map[string]bool) *EventState {
 	}
 }
 
-func NewOptimizer(tree *ast.Tree, identMap map[ast.NodeID]*LocalSymbol, eventState *EventState, cacheGlobals, optimizeLoops, constantFolding, combineLocals, optimizeTableInsert bool, globalThreshold, maxLocals int) *Optimizer {
+func NewOptimizer(tree *ast.Tree, identMap map[ast.NodeID]*LocalSymbol, eventState *EventState, opts OptimizerOptions) *Optimizer {
 	return &Optimizer{
 		tree:                tree,
 		identMap:            identMap,
 		eventState:          eventState,
-		cacheGlobals:        cacheGlobals,
-		optimizeLoops:       optimizeLoops,
-		constantFolding:     constantFolding,
-		combineLocals:       combineLocals,
-		optimizeTableInsert: optimizeTableInsert,
-		globalThreshold:     globalThreshold,
-		maxLocals:           maxLocals,
+		cacheGlobals:        opts.CacheGlobals,
+		optimizeLoops:       opts.OptimizeLoops,
+		constantFolding:     opts.ConstantFolding,
+		combineLocals:       opts.CombineLocals,
+		optimizeTableInsert: opts.OptimizeTableInsert,
+		globalThreshold:     opts.GlobalThreshold,
+		maxLocals:           opts.MaxLocals,
+
+		foldGetHashKey:    opts.FoldGetHashKey,
+		simplifyCitizen:   opts.SimplifyCitizen,
+		fixpoint:          opts.Fixpoint,
+		foldStringConcat:  opts.FoldStringConcat,
+		foldUnary:         opts.FoldUnary,
+		foldLogical:       opts.FoldLogical,
+		deadCode:          opts.DeadCode,
+		renameCalls:       opts.RenameCalls,
+		skipEventContexts: opts.SkipEventContexts,
 	}
 }
 
@@ -80,8 +120,51 @@ func (opt *Optimizer) Optimize() {
 		opt.obfuscateEventNames()
 	}
 
-	if opt.constantFolding {
-		opt.foldConstants(opt.tree.Root)
+	if opt.simplifyCitizen {
+		opt.simplifyCitizenCalls(opt.tree.Root)
+	}
+
+	if len(opt.renameCalls) > 0 {
+		opt.renameCallTargets(opt.tree.Root)
+	}
+
+	needsFixpoint := opt.constantFolding || opt.foldGetHashKey || opt.foldStringConcat ||
+		opt.foldUnary || opt.foldLogical || opt.deadCode
+
+	if needsFixpoint {
+		for iter := 0; iter < 100; iter++ {
+			before := opt.treeSignature()
+
+			if opt.constantFolding {
+				opt.foldConstants(opt.tree.Root)
+			}
+
+			if opt.foldStringConcat {
+				opt.foldStringConcats(opt.tree.Root)
+			}
+
+			if opt.foldUnary {
+				opt.foldUnaryExprs(opt.tree.Root)
+			}
+
+			if opt.foldGetHashKey {
+				opt.foldGetHashKeyCalls(opt.tree.Root)
+			}
+
+			if opt.foldLogical {
+				opt.foldLogicalExprs(opt.tree.Root)
+			}
+
+			if opt.deadCode {
+				opt.eliminateDeadCode(opt.tree.Root)
+			}
+
+			after := opt.treeSignature()
+
+			if !opt.fixpoint || before == after {
+				break
+			}
+		}
 	}
 
 	if opt.optimizeLoops {
@@ -111,7 +194,11 @@ func (opt *Optimizer) foldConstants(nodeID ast.NodeID) {
 	opt.foldConstants(node.Left)
 	opt.foldConstants(node.Right)
 
-	if node.Count > 0 && node.Kind != ast.KindBlock && node.Kind != ast.KindFile {
+	if node.Kind == ast.KindForIn && node.Extra != 0 {
+		opt.foldConstants(ast.NodeID(node.Extra))
+	}
+
+	if node.Count > 0 && node.Kind != ast.KindFile {
 		for i := range node.Count {
 			opt.foldConstants(opt.tree.ExtraList[node.Extra+uint32(i)])
 		}
@@ -1431,7 +1518,7 @@ func (opt *Optimizer) transformTableInsert(callNodeID, tID, vID ast.NodeID) {
 
 func (opt *Optimizer) obfuscateEventNames() {
 	opt.collectEventNames(opt.tree.Root)
-	opt.replaceEventStrings(opt.tree.Root)
+	opt.replaceEventStrings(opt.tree.Root, false)
 }
 
 func (opt *Optimizer) collectEventNames(nodeID ast.NodeID) {
@@ -1474,27 +1561,35 @@ func (opt *Optimizer) collectEventNames(nodeID ast.NodeID) {
 	}
 }
 
-func (opt *Optimizer) replaceEventStrings(nodeID ast.NodeID) {
+func (opt *Optimizer) replaceEventStrings(nodeID ast.NodeID, skip bool) {
 	if nodeID == ast.InvalidNode {
 		return
 	}
 
 	node := opt.tree.Nodes[nodeID]
 
+	if !skip && (node.Kind == ast.KindCallExpr || node.Kind == ast.KindMethodCall) {
+		if callName, ok := opt.getCallName(nodeID); ok && opt.skipEventContexts[callName] {
+			skip = true
+		}
+	}
+
 	if node.Kind == ast.KindString && node.End > node.Start+1 && opt.tree.Source[node.Start] != '[' {
-		content := string(opt.tree.Source[node.Start+1 : node.End-1])
+		if !skip {
+			content := string(opt.tree.Source[node.Start+1 : node.End-1])
 
-		if minified, ok := opt.eventState.Map[content]; ok {
-			newStr := `"` + minified + `"`
-			start := uint32(len(opt.tree.Source))
-			opt.tree.Source = append(opt.tree.Source, []byte(newStr)...)
-			end := uint32(len(opt.tree.Source))
+			if minified, ok := opt.eventState.Map[content]; ok {
+				newStr := `"` + minified + `"`
+				start := uint32(len(opt.tree.Source))
+				opt.tree.Source = append(opt.tree.Source, []byte(newStr)...)
+				end := uint32(len(opt.tree.Source))
 
-			opt.tree.Nodes[nodeID] = ast.Node{
-				Kind:   ast.KindString,
-				Start:  start,
-				End:    end,
-				Parent: node.Parent,
+				opt.tree.Nodes[nodeID] = ast.Node{
+					Kind:   ast.KindString,
+					Start:  start,
+					End:    end,
+					Parent: node.Parent,
+				}
 			}
 		}
 
@@ -1503,15 +1598,15 @@ func (opt *Optimizer) replaceEventStrings(nodeID ast.NodeID) {
 
 	if node.Kind == ast.KindBlock {
 		for i := range node.Count {
-			opt.replaceEventStrings(opt.tree.ExtraList[node.Extra+uint32(i)])
+			opt.replaceEventStrings(opt.tree.ExtraList[node.Extra+uint32(i)], skip)
 		}
 	} else {
-		opt.replaceEventStrings(node.Left)
-		opt.replaceEventStrings(node.Right)
+		opt.replaceEventStrings(node.Left, skip)
+		opt.replaceEventStrings(node.Right, skip)
 
 		if node.Count > 0 && node.Kind != ast.KindFile {
 			for i := range node.Count {
-				opt.replaceEventStrings(opt.tree.ExtraList[node.Extra+uint32(i)])
+				opt.replaceEventStrings(opt.tree.ExtraList[node.Extra+uint32(i)], skip)
 			}
 		}
 	}
@@ -1603,4 +1698,669 @@ func (opt *Optimizer) nextEventName() string {
 			return name
 		}
 	}
+}
+
+func (opt *Optimizer) treeSignature() uint64 {
+	var h uint64
+
+	for i := range opt.tree.Nodes {
+		n := opt.tree.Nodes[i]
+		h = h*31 + uint64(n.Kind)
+		h = h*31 + uint64(n.Left)
+		h = h*31 + uint64(n.Right)
+		h = h*31 + uint64(n.Extra)
+		h = h*31 + uint64(n.Count)
+	}
+
+	return h
+}
+
+func (opt *Optimizer) foldStringConcats(nodeID ast.NodeID) {
+	if nodeID == ast.InvalidNode {
+		return
+	}
+
+	node := opt.tree.Nodes[nodeID]
+
+	if node.Kind == ast.KindBlock {
+		for i := range node.Count {
+			opt.foldStringConcats(opt.tree.ExtraList[node.Extra+uint32(i)])
+		}
+
+		return
+	}
+
+	opt.foldStringConcats(node.Left)
+	opt.foldStringConcats(node.Right)
+
+	if node.Kind == ast.KindForIn && node.Extra != 0 {
+		opt.foldStringConcats(ast.NodeID(node.Extra))
+	}
+
+	if node.Count > 0 && node.Kind != ast.KindFile {
+		for i := range node.Count {
+			opt.foldStringConcats(opt.tree.ExtraList[node.Extra+uint32(i)])
+		}
+	}
+
+	if node.Kind == ast.KindBinaryExpr && token.Kind(node.Extra) == token.Concat {
+		leftNode := opt.tree.Nodes[node.Left]
+		rightNode := opt.tree.Nodes[node.Right]
+
+		if leftNode.Kind == ast.KindString && rightNode.Kind == ast.KindString {
+			opt.tryFoldStringConcat(nodeID, node)
+		}
+	}
+}
+
+func (opt *Optimizer) tryFoldStringConcat(nodeID ast.NodeID, node ast.Node) bool {
+	leftNode := opt.tree.Nodes[node.Left]
+	rightNode := opt.tree.Nodes[node.Right]
+
+	leftRaw := opt.tree.Source[leftNode.Start:leftNode.End]
+	rightRaw := opt.tree.Source[rightNode.Start:rightNode.End]
+
+	if len(leftRaw) < 2 || len(rightRaw) < 2 {
+		return false
+	}
+
+	leftQuote := leftRaw[0]
+	rightQuote := rightRaw[0]
+
+	if (leftQuote != '"' && leftQuote != '\'') || (rightQuote != '"' && rightQuote != '\'') {
+		return false
+	}
+
+	if leftQuote != rightQuote {
+		return false
+	}
+
+	if bytes.Contains(leftRaw, []byte{'\\'}) || bytes.Contains(rightRaw, []byte{'\\'}) {
+		return false
+	}
+
+	combined := make([]byte, 0, len(leftRaw)+len(rightRaw)-2)
+	combined = append(combined, leftRaw[:len(leftRaw)-1]...)
+	combined = append(combined, rightRaw[1:]...)
+
+	start := uint32(len(opt.tree.Source))
+	opt.tree.Source = append(opt.tree.Source, combined...)
+	end := uint32(len(opt.tree.Source))
+
+	opt.tree.Nodes[nodeID] = ast.Node{
+		Kind:   ast.KindString,
+		Start:  start,
+		End:    end,
+		Parent: node.Parent,
+	}
+
+	return true
+}
+
+func (opt *Optimizer) foldUnaryExprs(nodeID ast.NodeID) {
+	if nodeID == ast.InvalidNode {
+		return
+	}
+
+	node := opt.tree.Nodes[nodeID]
+
+	if node.Kind == ast.KindBlock {
+		for i := range node.Count {
+			opt.foldUnaryExprs(opt.tree.ExtraList[node.Extra+uint32(i)])
+		}
+
+		return
+	}
+
+	opt.foldUnaryExprs(node.Left)
+	opt.foldUnaryExprs(node.Right)
+
+	if node.Kind == ast.KindForIn && node.Extra != 0 {
+		opt.foldUnaryExprs(ast.NodeID(node.Extra))
+	}
+
+	if node.Count > 0 && node.Kind != ast.KindFile {
+		for i := range node.Count {
+			opt.foldUnaryExprs(opt.tree.ExtraList[node.Extra+uint32(i)])
+		}
+	}
+
+	if node.Kind == ast.KindUnaryExpr {
+		opt.tryFoldUnaryExpr(nodeID, node)
+	}
+}
+
+func (opt *Optimizer) tryFoldUnaryExpr(nodeID ast.NodeID, node ast.Node) {
+	operandNode := opt.tree.Nodes[node.Right]
+	opChar := opt.tree.Source[node.Start]
+
+	switch opChar {
+	case '-':
+		if operandNode.Kind == ast.KindNumber {
+			val, ok := opt.parseNumber(node.Right)
+
+			if ok {
+				resVal := -val
+				var str string
+
+				if resVal == math.Floor(resVal) && resVal >= math.MinInt64 && resVal <= math.MaxInt64 {
+					str = strconv.FormatInt(int64(resVal), 10)
+				} else {
+					str = strconv.FormatFloat(resVal, 'g', -1, 64)
+				}
+
+				start := uint32(len(opt.tree.Source))
+				opt.tree.Source = append(opt.tree.Source, []byte(str)...)
+				end := uint32(len(opt.tree.Source))
+
+				opt.tree.Nodes[nodeID] = ast.Node{
+					Kind:   ast.KindNumber,
+					Start:  start,
+					End:    end,
+					Parent: node.Parent,
+				}
+			}
+		}
+
+		if operandNode.Kind == ast.KindUnaryExpr && opt.tree.Source[operandNode.Start] == '-' {
+			innerNode := opt.tree.Nodes[operandNode.Right]
+
+			opt.tree.Nodes[nodeID] = ast.Node{
+				Kind:   innerNode.Kind,
+				Start:  innerNode.Start,
+				End:    innerNode.End,
+				Left:   innerNode.Left,
+				Right:  innerNode.Right,
+				Extra:  innerNode.Extra,
+				Count:  innerNode.Count,
+				Parent: node.Parent,
+			}
+		}
+	case 'n':
+		if operandNode.Kind == ast.KindTrue {
+			opt.tree.Nodes[nodeID] = ast.Node{
+				Kind:   ast.KindFalse,
+				Parent: node.Parent,
+			}
+		} else if operandNode.Kind == ast.KindFalse {
+			opt.tree.Nodes[nodeID] = ast.Node{
+				Kind:   ast.KindTrue,
+				Parent: node.Parent,
+			}
+		} else if operandNode.Kind == ast.KindNil {
+			opt.tree.Nodes[nodeID] = ast.Node{
+				Kind:   ast.KindTrue,
+				Parent: node.Parent,
+			}
+		}
+	case '#':
+		if operandNode.Kind == ast.KindString && operandNode.End > operandNode.Start+1 {
+			quote := opt.tree.Source[operandNode.Start]
+
+			if quote == '"' || quote == '\'' {
+				content := opt.tree.Source[operandNode.Start+1 : operandNode.End-1]
+
+				if !bytes.Contains(content, []byte{'\\'}) {
+					str := strconv.Itoa(len(content))
+					start := uint32(len(opt.tree.Source))
+					opt.tree.Source = append(opt.tree.Source, []byte(str)...)
+					end := uint32(len(opt.tree.Source))
+
+					opt.tree.Nodes[nodeID] = ast.Node{
+						Kind:   ast.KindNumber,
+						Start:  start,
+						End:    end,
+						Parent: node.Parent,
+					}
+				}
+			}
+		}
+	}
+}
+
+func (opt *Optimizer) foldGetHashKeyCalls(nodeID ast.NodeID) {
+	if nodeID == ast.InvalidNode {
+		return
+	}
+
+	node := opt.tree.Nodes[nodeID]
+
+	if node.Kind == ast.KindBlock {
+		for i := range node.Count {
+			opt.foldGetHashKeyCalls(opt.tree.ExtraList[node.Extra+uint32(i)])
+		}
+
+		return
+	}
+
+	opt.foldGetHashKeyCalls(node.Left)
+	opt.foldGetHashKeyCalls(node.Right)
+
+	if node.Kind == ast.KindForIn && node.Extra != 0 {
+		opt.foldGetHashKeyCalls(ast.NodeID(node.Extra))
+	}
+
+	if node.Count > 0 && node.Kind != ast.KindFile {
+		for i := range node.Count {
+			opt.foldGetHashKeyCalls(opt.tree.ExtraList[node.Extra+uint32(i)])
+		}
+	}
+
+	if node.Kind == ast.KindCallExpr && node.Left != ast.InvalidNode {
+		calleeNode := opt.tree.Nodes[node.Left]
+
+		if calleeNode.Kind == ast.KindIdent {
+			if _, isLocal := opt.identMap[node.Left]; !isLocal {
+				calleeName := string(opt.tree.Source[calleeNode.Start:calleeNode.End])
+
+				if calleeName == "GetHashKey" && node.Count == 1 {
+					argID := opt.tree.ExtraList[node.Extra]
+					argNode := opt.tree.Nodes[argID]
+
+					if argNode.Kind == ast.KindString && argNode.End > argNode.Start+1 {
+						quote := opt.tree.Source[argNode.Start]
+
+						if quote == '"' || quote == '\'' {
+							content := string(opt.tree.Source[argNode.Start+1 : argNode.End-1])
+							hash := joaat(content)
+							str := strconv.FormatInt(int64(hash), 10)
+
+							start := uint32(len(opt.tree.Source))
+							opt.tree.Source = append(opt.tree.Source, []byte(str)...)
+							end := uint32(len(opt.tree.Source))
+
+							opt.tree.Nodes[nodeID] = ast.Node{
+								Kind:   ast.KindNumber,
+								Start:  start,
+								End:    end,
+								Parent: node.Parent,
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+func (opt *Optimizer) foldLogicalExprs(nodeID ast.NodeID) {
+	if nodeID == ast.InvalidNode {
+		return
+	}
+
+	node := opt.tree.Nodes[nodeID]
+
+	if node.Kind == ast.KindBlock {
+		for i := range node.Count {
+			opt.foldLogicalExprs(opt.tree.ExtraList[node.Extra+uint32(i)])
+		}
+
+		return
+	}
+
+	opt.foldLogicalExprs(node.Left)
+	opt.foldLogicalExprs(node.Right)
+
+	if node.Kind == ast.KindForIn && node.Extra != 0 {
+		opt.foldLogicalExprs(ast.NodeID(node.Extra))
+	}
+
+	if node.Count > 0 && node.Kind != ast.KindFile {
+		for i := range node.Count {
+			opt.foldLogicalExprs(opt.tree.ExtraList[node.Extra+uint32(i)])
+		}
+	}
+
+	if node.Kind == ast.KindBinaryExpr {
+		op := token.Kind(node.Extra)
+		leftNode := opt.tree.Nodes[node.Left]
+
+		switch op {
+		case token.And:
+			if leftNode.Kind == ast.KindTrue {
+				rightNode := opt.tree.Nodes[node.Right]
+
+				opt.tree.Nodes[nodeID] = ast.Node{
+					Kind:   rightNode.Kind,
+					Start:  rightNode.Start,
+					End:    rightNode.End,
+					Left:   rightNode.Left,
+					Right:  rightNode.Right,
+					Extra:  rightNode.Extra,
+					Count:  rightNode.Count,
+					Parent: node.Parent,
+				}
+			} else if leftNode.Kind == ast.KindFalse && opt.isSideEffectFree(node.Right) {
+				opt.tree.Nodes[nodeID] = ast.Node{
+					Kind:   ast.KindFalse,
+					Parent: node.Parent,
+				}
+			}
+		case token.Or:
+			if leftNode.Kind == ast.KindFalse {
+				rightNode := opt.tree.Nodes[node.Right]
+
+				opt.tree.Nodes[nodeID] = ast.Node{
+					Kind:   rightNode.Kind,
+					Start:  rightNode.Start,
+					End:    rightNode.End,
+					Left:   rightNode.Left,
+					Right:  rightNode.Right,
+					Extra:  rightNode.Extra,
+					Count:  rightNode.Count,
+					Parent: node.Parent,
+				}
+			} else if leftNode.Kind == ast.KindTrue && opt.isSideEffectFree(node.Right) {
+				opt.tree.Nodes[nodeID] = ast.Node{
+					Kind:   ast.KindTrue,
+					Parent: node.Parent,
+				}
+			}
+		}
+	}
+}
+
+func (opt *Optimizer) isSideEffectFree(nodeID ast.NodeID) bool {
+	if nodeID == ast.InvalidNode {
+		return true
+	}
+
+	node := opt.tree.Nodes[nodeID]
+
+	switch node.Kind {
+	case ast.KindNumber, ast.KindString, ast.KindNil, ast.KindTrue, ast.KindFalse, ast.KindVararg:
+		return true
+	case ast.KindIdent:
+		return true
+	case ast.KindMemberExpr:
+		return opt.isSideEffectFree(node.Left)
+	case ast.KindParenExpr:
+		return opt.isSideEffectFree(node.Left)
+	case ast.KindBinaryExpr:
+		return opt.isSideEffectFree(node.Left) && opt.isSideEffectFree(node.Right)
+	case ast.KindUnaryExpr:
+		return opt.isSideEffectFree(node.Right)
+	case ast.KindTableExpr:
+		for i := range node.Count {
+			if !opt.isSideEffectFree(opt.tree.ExtraList[node.Extra+uint32(i)]) {
+				return false
+			}
+		}
+
+		return true
+	default:
+		return false
+	}
+}
+
+func (opt *Optimizer) hasGotoOrLabel(nodeID ast.NodeID) bool {
+	if nodeID == ast.InvalidNode {
+		return false
+	}
+
+	node := opt.tree.Nodes[nodeID]
+
+	if node.Kind == ast.KindGoto || node.Kind == ast.KindLabel {
+		return true
+	}
+
+	if opt.hasGotoOrLabel(node.Left) || opt.hasGotoOrLabel(node.Right) {
+		return true
+	}
+
+	if node.Kind == ast.KindForIn && node.Extra != 0 {
+		if opt.hasGotoOrLabel(ast.NodeID(node.Extra)) {
+			return true
+		}
+	}
+
+	for i := range node.Count {
+		if opt.hasGotoOrLabel(opt.tree.ExtraList[node.Extra+uint32(i)]) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (opt *Optimizer) eliminateDeadCode(nodeID ast.NodeID) {
+	if nodeID == ast.InvalidNode {
+		return
+	}
+
+	node := opt.tree.Nodes[nodeID]
+
+	if node.Kind == ast.KindBlock {
+		hasJump := false
+
+		for i := range node.Count {
+			if opt.hasGotoOrLabel(opt.tree.ExtraList[node.Extra+uint32(i)]) {
+				hasJump = true
+				break
+			}
+		}
+
+		var newStmts []ast.NodeID
+		changed := false
+		unreachable := false
+
+		for i := range node.Count {
+			childID := opt.tree.ExtraList[node.Extra+uint32(i)]
+
+			opt.eliminateDeadCode(childID)
+
+			if unreachable && !hasJump {
+				changed = true
+				continue
+			}
+
+			childNode := opt.tree.Nodes[childID]
+
+			if childNode.Kind == ast.KindIf {
+				condNode := opt.tree.Nodes[childNode.Left]
+
+				if condNode.Kind == ast.KindTrue {
+					blockNode := opt.tree.Nodes[childNode.Right]
+
+					for j := range blockNode.Count {
+						stmtID := opt.tree.ExtraList[blockNode.Extra+uint32(j)]
+						newStmts = append(newStmts, stmtID)
+						opt.tree.Nodes[stmtID].Parent = nodeID
+					}
+
+					changed = true
+					continue
+				}
+
+				if condNode.Kind == ast.KindFalse {
+					if childNode.Count == 0 {
+						changed = true
+						continue
+					}
+
+					if childNode.Count == 1 {
+						elseID := opt.tree.ExtraList[childNode.Extra]
+						elseNode := opt.tree.Nodes[elseID]
+
+						if elseNode.Kind == ast.KindElse {
+							blockNode := opt.tree.Nodes[elseNode.Left]
+
+							for j := range blockNode.Count {
+								stmtID := opt.tree.ExtraList[blockNode.Extra+uint32(j)]
+								newStmts = append(newStmts, stmtID)
+								opt.tree.Nodes[stmtID].Parent = nodeID
+							}
+
+							changed = true
+							continue
+						}
+					}
+				}
+			}
+
+			if childNode.Kind == ast.KindWhile {
+				condNode := opt.tree.Nodes[childNode.Left]
+
+				if condNode.Kind == ast.KindFalse {
+					changed = true
+					continue
+				}
+			}
+
+			newStmts = append(newStmts, childID)
+
+			if childNode.Kind == ast.KindReturn || childNode.Kind == ast.KindBreak {
+				unreachable = true
+			}
+		}
+
+		if changed {
+			extraStart := uint32(len(opt.tree.ExtraList))
+			opt.tree.ExtraList = append(opt.tree.ExtraList, newStmts...)
+
+			opt.tree.Nodes[nodeID].Extra = extraStart
+			opt.tree.Nodes[nodeID].Count = uint16(len(newStmts))
+
+			for _, stmtID := range newStmts {
+				opt.tree.Nodes[stmtID].Parent = nodeID
+			}
+		}
+	} else {
+		opt.eliminateDeadCode(node.Left)
+		opt.eliminateDeadCode(node.Right)
+
+		if node.Kind == ast.KindForIn && node.Extra != 0 {
+			opt.eliminateDeadCode(ast.NodeID(node.Extra))
+		}
+
+		if node.Count > 0 && node.Kind != ast.KindFile {
+			for i := range node.Count {
+				opt.eliminateDeadCode(opt.tree.ExtraList[node.Extra+uint32(i)])
+			}
+		}
+	}
+}
+
+func (opt *Optimizer) simplifyCitizenCalls(nodeID ast.NodeID) {
+	if nodeID == ast.InvalidNode {
+		return
+	}
+
+	node := opt.tree.Nodes[nodeID]
+
+	if node.Kind == ast.KindBlock {
+		for i := range node.Count {
+			opt.simplifyCitizenCalls(opt.tree.ExtraList[node.Extra+uint32(i)])
+		}
+
+		return
+	}
+
+	opt.simplifyCitizenCalls(node.Left)
+	opt.simplifyCitizenCalls(node.Right)
+
+	if node.Kind == ast.KindForIn && node.Extra != 0 {
+		opt.simplifyCitizenCalls(ast.NodeID(node.Extra))
+	}
+
+	if node.Count > 0 && node.Kind != ast.KindFile {
+		for i := range node.Count {
+			opt.simplifyCitizenCalls(opt.tree.ExtraList[node.Extra+uint32(i)])
+		}
+	}
+
+	if node.Kind == ast.KindCallExpr && node.Left != ast.InvalidNode {
+		calleeNode := opt.tree.Nodes[node.Left]
+
+		if calleeNode.Kind == ast.KindMemberExpr {
+			baseNode := opt.tree.Nodes[calleeNode.Left]
+			rightNode := opt.tree.Nodes[calleeNode.Right]
+
+			if baseNode.Kind == ast.KindIdent && rightNode.Kind == ast.KindIdent {
+				if _, isLocal := opt.identMap[calleeNode.Left]; !isLocal {
+					baseName := string(opt.tree.Source[baseNode.Start:baseNode.End])
+					rightName := string(opt.tree.Source[rightNode.Start:rightNode.End])
+
+					if baseName == "Citizen" && (rightName == "Wait" || rightName == "CreateThread") {
+						opt.tree.Nodes[node.Left] = ast.Node{
+							Kind:   ast.KindIdent,
+							Start:  rightNode.Start,
+							End:    rightNode.End,
+							Parent: nodeID,
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+func (opt *Optimizer) renameCallTargets(nodeID ast.NodeID) {
+	if nodeID == ast.InvalidNode {
+		return
+	}
+
+	node := opt.tree.Nodes[nodeID]
+
+	if node.Kind == ast.KindBlock {
+		for i := range node.Count {
+			opt.renameCallTargets(opt.tree.ExtraList[node.Extra+uint32(i)])
+		}
+
+		return
+	}
+
+	opt.renameCallTargets(node.Left)
+	opt.renameCallTargets(node.Right)
+
+	if node.Kind == ast.KindForIn && node.Extra != 0 {
+		opt.renameCallTargets(ast.NodeID(node.Extra))
+	}
+
+	if node.Count > 0 && node.Kind != ast.KindFile {
+		for i := range node.Count {
+			opt.renameCallTargets(opt.tree.ExtraList[node.Extra+uint32(i)])
+		}
+	}
+
+	if node.Kind == ast.KindCallExpr && node.Left != ast.InvalidNode {
+		calleeNode := opt.tree.Nodes[node.Left]
+
+		if calleeNode.Kind == ast.KindIdent {
+			if _, isLocal := opt.identMap[node.Left]; !isLocal {
+				name := string(opt.tree.Source[calleeNode.Start:calleeNode.End])
+
+				if newName, ok := opt.renameCalls[name]; ok {
+					start := uint32(len(opt.tree.Source))
+					opt.tree.Source = append(opt.tree.Source, []byte(newName)...)
+					end := uint32(len(opt.tree.Source))
+
+					opt.tree.Nodes[node.Left] = ast.Node{
+						Kind:   ast.KindIdent,
+						Start:  start,
+						End:    end,
+						Parent: nodeID,
+					}
+				}
+			}
+		}
+	}
+}
+
+func joaat(s string) int32 {
+	s = strings.ToLower(s)
+
+	h := uint32(0)
+
+	for i := 0; i < len(s); i++ {
+		h += uint32(s[i])
+		h += h << 10
+		h ^= h >> 6
+	}
+
+	h += h << 3
+	h ^= h >> 11
+	h += h << 15
+
+	return int32(h)
 }

@@ -2,16 +2,18 @@ package minifier
 
 import (
 	"bytes"
+	"strings"
 
 	"github.com/coalaura/lugo/ast"
 	"github.com/coalaura/lugo/token"
 )
 
 type Minifier struct {
-	Tree     *ast.Tree
-	IdentMap map[ast.NodeID]*LocalSymbol
-	Buf      bytes.Buffer
-	LastChar byte
+	Tree           *ast.Tree
+	IdentMap       map[ast.NodeID]*LocalSymbol
+	Buf            bytes.Buffer
+	LastChar       byte
+	ShortenNumbers bool
 }
 
 func NewMinifier(tree *ast.Tree, identMap map[ast.NodeID]*LocalSymbol) *Minifier {
@@ -100,7 +102,15 @@ func (m *Minifier) printNode(nodeID ast.NodeID) {
 		} else {
 			m.Write(string(m.Tree.Source[node.Start:node.End]))
 		}
-	case ast.KindNumber, ast.KindString:
+	case ast.KindNumber:
+		s := string(m.Tree.Source[node.Start:node.End])
+
+		if m.ShortenNumbers {
+			s = shortenNumber(s)
+		}
+
+		m.Write(s)
+	case ast.KindString:
 		m.Write(string(m.Tree.Source[node.Start:node.End]))
 	case ast.KindNil:
 		m.Write("nil")
@@ -382,4 +392,24 @@ func operatorString(k token.Kind) string {
 	default:
 		return ""
 	}
+}
+
+func shortenNumber(s string) string {
+	if len(s) < 3 {
+		return s
+	}
+
+	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
+		return s
+	}
+
+	if strings.HasPrefix(s, "0.") {
+		return s[1:]
+	}
+
+	if strings.HasSuffix(s, ".0") && !strings.HasPrefix(s, "0.") {
+		return s[:len(s)-2]
+	}
+
+	return s
 }
