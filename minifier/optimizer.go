@@ -11,12 +11,29 @@ import (
 	"github.com/coalaura/lugo/token"
 )
 
+var DefaultEventFunctions = []string{
+	"RegisterNetEvent",
+	"RegisterServerEvent",
+	"RegisterClientEvent",
+	"AddEventHandler",
+	"TriggerEvent",
+	"TriggerClientEvent",
+	"TriggerServerEvent",
+}
+
+type EventState struct {
+	Functions map[string]bool
+	Map       map[string]string
+	Counter   int
+}
+
 type Optimizer struct {
 	tree                *ast.Tree
 	identMap            map[ast.NodeID]*LocalSymbol
 	globalThreshold     int
 	maxLocals           int
 	iteratorIndex       int
+	eventState          *EventState
 	cacheGlobals        bool
 	optimizeLoops       bool
 	constantFolding     bool
@@ -24,10 +41,18 @@ type Optimizer struct {
 	optimizeTableInsert bool
 }
 
-func NewOptimizer(tree *ast.Tree, identMap map[ast.NodeID]*LocalSymbol, cacheGlobals, optimizeLoops, constantFolding, combineLocals, optimizeTableInsert bool, globalThreshold, maxLocals int) *Optimizer {
+func NewEventState(functions map[string]bool) *EventState {
+	return &EventState{
+		Functions: functions,
+		Map:       make(map[string]string),
+	}
+}
+
+func NewOptimizer(tree *ast.Tree, identMap map[ast.NodeID]*LocalSymbol, eventState *EventState, cacheGlobals, optimizeLoops, constantFolding, combineLocals, optimizeTableInsert bool, globalThreshold, maxLocals int) *Optimizer {
 	return &Optimizer{
 		tree:                tree,
 		identMap:            identMap,
+		eventState:          eventState,
 		cacheGlobals:        cacheGlobals,
 		optimizeLoops:       optimizeLoops,
 		constantFolding:     constantFolding,
@@ -51,6 +76,10 @@ func (opt *Optimizer) safeLocalName(prefix string, index *int) string {
 }
 
 func (opt *Optimizer) Optimize() {
+	if opt.eventState != nil {
+		opt.obfuscateEventNames()
+	}
+
 	if opt.constantFolding {
 		opt.foldConstants(opt.tree.Root)
 	}
@@ -1400,18 +1429,178 @@ func (opt *Optimizer) transformTableInsert(callNodeID, tID, vID ast.NodeID) {
 	opt.tree.Nodes[rhsListID].Parent = callNodeID
 }
 
-func importSort(slice []string) {
-	for i := 1; i < len(slice); i++ {
-		j := i
+func (opt *Optimizer) obfuscateEventNames() {
+	opt.collectEventNames(opt.tree.Root)
+	opt.replaceEventStrings(opt.tree.Root)
+}
 
-		for j > 0 {
-			if len(slice[j-1]) < len(slice[j]) || (len(slice[j-1]) == len(slice[j]) && slice[j-1] < slice[j]) {
-				slice[j-1], slice[j] = slice[j], slice[j-1]
+func (opt *Optimizer) collectEventNames(nodeID ast.NodeID) {
+	if nodeID == ast.InvalidNode {
+		return
+	}
 
-				j--
-			} else {
+	node := opt.tree.Nodes[nodeID]
+
+	if node.Kind == ast.KindCallExpr || node.Kind == ast.KindMethodCall {
+		if callName, ok := opt.getCallName(nodeID); ok && opt.eventState.Functions[callName] {
+			if node.Count >= 1 {
+				argID := opt.tree.ExtraList[node.Extra]
+				argNode := opt.tree.Nodes[argID]
+
+				if argNode.Kind == ast.KindString && argNode.End > argNode.Start+1 && opt.tree.Source[argNode.Start] != '[' {
+					originalName := string(opt.tree.Source[argNode.Start+1 : argNode.End-1])
+
+					if _, exists := opt.eventState.Map[originalName]; !exists {
+						opt.eventState.Map[originalName] = opt.nextEventName()
+					}
+				}
+			}
+		}
+	}
+
+	if node.Kind == ast.KindBlock {
+		for i := range node.Count {
+			opt.collectEventNames(opt.tree.ExtraList[node.Extra+uint32(i)])
+		}
+	} else {
+		opt.collectEventNames(node.Left)
+		opt.collectEventNames(node.Right)
+
+		if node.Count > 0 && node.Kind != ast.KindFile {
+			for i := range node.Count {
+				opt.collectEventNames(opt.tree.ExtraList[node.Extra+uint32(i)])
+			}
+		}
+	}
+}
+
+func (opt *Optimizer) replaceEventStrings(nodeID ast.NodeID) {
+	if nodeID == ast.InvalidNode {
+		return
+	}
+
+	node := opt.tree.Nodes[nodeID]
+
+	if node.Kind == ast.KindString && node.End > node.Start+1 && opt.tree.Source[node.Start] != '[' {
+		content := string(opt.tree.Source[node.Start+1 : node.End-1])
+
+		if minified, ok := opt.eventState.Map[content]; ok {
+			newStr := `"` + minified + `"`
+			start := uint32(len(opt.tree.Source))
+			opt.tree.Source = append(opt.tree.Source, []byte(newStr)...)
+			end := uint32(len(opt.tree.Source))
+
+			opt.tree.Nodes[nodeID] = ast.Node{
+				Kind:   ast.KindString,
+				Start:  start,
+				End:    end,
+				Parent: node.Parent,
+			}
+		}
+
+		return
+	}
+
+	if node.Kind == ast.KindBlock {
+		for i := range node.Count {
+			opt.replaceEventStrings(opt.tree.ExtraList[node.Extra+uint32(i)])
+		}
+	} else {
+		opt.replaceEventStrings(node.Left)
+		opt.replaceEventStrings(node.Right)
+
+		if node.Count > 0 && node.Kind != ast.KindFile {
+			for i := range node.Count {
+				opt.replaceEventStrings(opt.tree.ExtraList[node.Extra+uint32(i)])
+			}
+		}
+	}
+}
+
+func (opt *Optimizer) getCallName(nodeID ast.NodeID) (string, bool) {
+	if nodeID == ast.InvalidNode {
+		return "", false
+	}
+
+	node := opt.tree.Nodes[nodeID]
+
+	switch node.Kind {
+	case ast.KindCallExpr:
+		calleeID := node.Left
+		callee := opt.tree.Nodes[calleeID]
+
+		if callee.Kind == ast.KindIdent {
+			// skip locals to avoid false positives
+			if _, isLocal := opt.identMap[calleeID]; isLocal {
+				return "", false
+			}
+
+			return string(opt.tree.Source[callee.Start:callee.End]), true
+		}
+
+		// match by name without local checks
+		return opt.getCalleePath(calleeID)
+	case ast.KindMethodCall:
+		leftPath, ok := opt.getCalleePath(node.Left)
+		if !ok {
+			return "", false
+		}
+
+		rightNode := opt.tree.Nodes[node.Right]
+		if rightNode.Kind != ast.KindIdent {
+			return "", false
+		}
+
+		rightName := string(opt.tree.Source[rightNode.Start:rightNode.End])
+		return leftPath + ":" + rightName, true
+	}
+
+	return "", false
+}
+
+func (opt *Optimizer) getCalleePath(nodeID ast.NodeID) (string, bool) {
+	if nodeID == ast.InvalidNode {
+		return "", false
+	}
+
+	node := opt.tree.Nodes[nodeID]
+
+	switch node.Kind {
+	case ast.KindIdent:
+		return string(opt.tree.Source[node.Start:node.End]), true
+	case ast.KindMemberExpr:
+		leftPath, ok := opt.getCalleePath(node.Left)
+		if !ok {
+			return "", false
+		}
+
+		rightNode := opt.tree.Nodes[node.Right]
+		if rightNode.Kind != ast.KindIdent {
+			return "", false
+		}
+
+		rightName := string(opt.tree.Source[rightNode.Start:rightNode.End])
+		return leftPath + "." + rightName, true
+	}
+
+	return "", false
+}
+
+func (opt *Optimizer) nextEventName() string {
+	for {
+		name := getMinifiedName(opt.eventState.Counter)
+		opt.eventState.Counter++
+
+		collision := false
+		for _, existing := range opt.eventState.Map {
+			if existing == name {
+				collision = true
 				break
 			}
+		}
+
+		if !collision {
+			return name
 		}
 	}
 }
