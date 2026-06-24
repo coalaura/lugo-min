@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -138,16 +141,89 @@ var command = &cli.Command{
 			Name:  "skip-event-strings-in",
 			Usage: "Comma-separated list of function names where event string replacement should be skipped",
 		},
+		&cli.StringSliceFlag{
+			Name:  "dump-calls",
+			Usage: "Comma-separated list of function names. The raw source of these calls will be dumped as JSON.",
+		},
+		&cli.StringSliceFlag{
+			Name:  "obfuscate-files",
+			Usage: "Comma-separated list of glob patterns (e.g. *_client.lua). Files matching these patterns will be wrapped in the obfuscator.",
+		},
 	},
 	Action: runMinify,
 }
 
 func main() {
+	rand.Seed(time.Now().UnixNano())
+
 	if err := command.Run(context.Background(), os.Args); err != nil {
 		fmt.Fprintf(os.Stderr, "Execution error: %v\n", err)
 
 		os.Exit(1)
 	}
+}
+
+func applyObfuscation(src []byte, filename string) []byte {
+	fNames := []string{"IllIllIllIllI", "IIlllIIlllIIlllIIlllII", "IIllllIIllll"}
+
+	randName := func() string {
+		return fNames[rand.Intn(len(fNames))]
+	}
+
+	var buf bytes.Buffer
+	buf.Grow(len(src) * 5)
+
+	buf.WriteString(`function IllIlllIllIlllIlllIlllIll(IllIlllIllIllIll) if (IllIlllIllIllIll==(((((919 + 636)-636)*3147)/3147)+919)) then return not true end if (IllIlllIllIllIll==(((((968 + 670)-670)*3315)/3315)+968)) then return not false end end; `)
+
+	buf.WriteString("local ")
+	buf.WriteString(randName())
+	buf.WriteString(" = (7*3-9/9+3*2/0+3*3);")
+	buf.WriteString("local ")
+	buf.WriteString(randName())
+	buf.WriteString(" = (3*4-7/7+6*4/3+9*9);")
+	buf.WriteString(`local IllIIIllIIIIllI = table.concat;`)
+
+	buf.WriteString("function IllIIIIllIIIIIl(")
+	buf.WriteString(randName())
+	buf.WriteString(") ")
+	buf.WriteString("function ")
+	buf.WriteString(randName())
+	buf.WriteString("(")
+	buf.WriteString(randName())
+	buf.WriteString(") ")
+	buf.WriteString("local ")
+	buf.WriteString(randName())
+	buf.WriteString(" = (5*3-2/8+9*2/9+8*3) ")
+	buf.WriteString("end end end;IllIIIIllIIIIIl(900283);")
+
+	buf.WriteString("function IllIlllIllIlllIlllIlllIllIlllIIIlll(")
+	buf.WriteString(randName())
+	buf.WriteString(") ")
+	buf.WriteString("function ")
+	buf.WriteString(randName())
+	buf.WriteString("(")
+	buf.WriteString(randName())
+	buf.WriteString(") ")
+	buf.WriteString("local ")
+	buf.WriteString(randName())
+	buf.WriteString(" = (9*0-7/5+3*1/3+8*2) ")
+	buf.WriteString("end end;IllIlllIllIlllIlllIlllIllIlllIIIlll(9083);")
+
+	buf.WriteString(`local IllIIllIIllIII = load;`)
+	buf.WriteString(`local IlIlIlIlIlIlIlIlII = {`)
+
+	for _, b := range src {
+		buf.WriteString(`'\`)
+		buf.WriteString(strconv.Itoa(int(b)))
+		buf.WriteString(`',`)
+	}
+
+	buf.WriteString(`}`)
+	buf.WriteString(`IllIIllIIllIII(IllIIIllIIIIllI(IlIlIlIlIlIlIlIlII,"''"), "`)
+	buf.WriteString(filename)
+	buf.WriteString(`")()`)
+
+	return buf.Bytes()
 }
 
 func runMinify(ctx context.Context, cmd *cli.Command) error {
@@ -171,15 +247,22 @@ func runMinify(ctx context.Context, cmd *cli.Command) error {
 
 	rawArgs := cmd.Args().Slice()
 
+	dumpTargets := cmd.StringSlice("dump-calls")
+	globalDumpedCalls := make(map[string][]string)
+
 	if len(rawArgs) == 0 {
 		src, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return fmt.Errorf("failed to read from stdin: %w", err)
 		}
 
-		out, err := minifySource(cmd, src, !cmd.Bool("no-rename"), eventState)
+		out, fileCalls, err := minifySource(cmd, src, !cmd.Bool("no-rename"), eventState, dumpTargets)
 		if err != nil {
 			return err
+		}
+
+		for k, v := range fileCalls {
+			globalDumpedCalls[k] = append(globalDumpedCalls[k], v...)
 		}
 
 		_, err = os.Stdout.Write(out)
@@ -226,15 +309,30 @@ func runMinify(ctx context.Context, cmd *cli.Command) error {
 		}
 	}
 
+	obfuscatePatterns := cmd.StringSlice("obfuscate-files")
+
 	for _, file := range args {
 		src, err := os.ReadFile(file)
 		if err != nil {
 			return fmt.Errorf("failed to read file %s: %w", file, err)
 		}
 
-		out, err := minifySource(cmd, src, !cmd.Bool("no-rename"), eventState)
+		out, fileCalls, err := minifySource(cmd, src, !cmd.Bool("no-rename"), eventState, dumpTargets)
 		if err != nil {
 			return fmt.Errorf("failed to minify %s: %w", file, err)
+		}
+
+		for k, v := range fileCalls {
+			globalDumpedCalls[k] = append(globalDumpedCalls[k], v...)
+		}
+
+		for _, pattern := range obfuscatePatterns {
+			matched, _ := filepath.Match(pattern, filepath.Base(file))
+			if matched {
+				out = applyObfuscation(out, filepath.ToSlash(file))
+
+				break
+			}
 		}
 
 		if cmd.Bool("write") {
@@ -290,14 +388,62 @@ func runMinify(ctx context.Context, cmd *cli.Command) error {
 		if err != nil {
 			return fmt.Errorf("failed to marshal event map: %w", err)
 		}
+	}
 
-		fmt.Println()
+	if len(globalDumpedCalls) > 0 {
+		fmt.Print("calls: ")
+
+		err := json.NewEncoder(os.Stdout).Encode(globalDumpedCalls)
+		if err != nil {
+			return fmt.Errorf("failed to marshal dumped calls: %w", err)
+		}
 	}
 
 	return nil
 }
 
-func minifySource(cmd *cli.Command, src []byte, renameLocals bool, eventState *minifier.EventState) ([]byte, error) {
+func extractCalls(tree *ast.Tree, targets []string) map[string][]string {
+	result := make(map[string][]string)
+	targetMap := make(map[string]bool)
+
+	for _, t := range targets {
+		targetMap[t] = true
+	}
+
+	for i := 1; i < len(tree.Nodes); i++ {
+		node := tree.Nodes[i]
+		if node.Kind == ast.KindCallExpr {
+			name := getCallTargetName(tree, node.Left)
+			if targetMap[name] {
+				result[name] = append(result[name], string(tree.Source[node.Start:node.End]))
+			}
+		}
+	}
+
+	return result
+}
+
+func getCallTargetName(tree *ast.Tree, calleeID ast.NodeID) string {
+	if calleeID == ast.InvalidNode {
+		return ""
+	}
+
+	callee := tree.Nodes[calleeID]
+	if callee.Kind == ast.KindIdent {
+		return string(tree.Source[callee.Start:callee.End])
+	}
+
+	if callee.Kind == ast.KindMemberExpr {
+		right := tree.Nodes[callee.Right]
+		if right.Kind == ast.KindIdent {
+			return string(tree.Source[right.Start:right.End])
+		}
+	}
+
+	return ""
+}
+
+func minifySource(cmd *cli.Command, src []byte, renameLocals bool, eventState *minifier.EventState, dumpTargets []string) ([]byte, map[string][]string, error) {
 	tree := ast.NewTree(src)
 
 	p := parser.New(src, tree, 50)
@@ -309,7 +455,13 @@ func minifySource(cmd *cli.Command, src []byte, renameLocals bool, eventState *m
 
 		line, col := tree.Position(first.Start)
 
-		return nil, fmt.Errorf("syntax error at line %d, col %d: %s", line+1, col+1, first.Message)
+		return nil, nil, fmt.Errorf("syntax error at line %d, col %d: %s", line+1, col+1, first.Message)
+	}
+
+	var dumpedCalls map[string][]string
+
+	if len(dumpTargets) > 0 {
+		dumpedCalls = extractCalls(tree, dumpTargets)
 	}
 
 	resolver := minifier.NewResolver(tree, renameLocals)
@@ -378,5 +530,5 @@ func minifySource(cmd *cli.Command, src []byte, renameLocals bool, eventState *m
 
 	printer.ShortenNumbers = cmd.Bool("shorten-numbers")
 
-	return printer.Minify(), nil
+	return printer.Minify(), dumpedCalls, nil
 }
